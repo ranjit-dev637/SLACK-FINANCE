@@ -1,0 +1,68 @@
+{
+  "info": {
+    "_postman_id": "b3e94473-10e3-4d69-a8ae-500b52d9aabc",
+    "name": "Finance Ingestion API",
+    "description": "Collection for testing the Finance Ingestion FastAPI backend",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Create Expense",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"expense_name\": \"Office Stationery Purchase\",\n  \"seller_name\": \"Stationery World\",\n  \"gst_amount\": 450.00,\n  \"total_amount\": 2850.00,\n  \"purchase_date\": \"2026-04-05\",\n  \"receipt_copy\": \"receipt_20260405_001.pdf\",\n  \"priority\": \"Medium\",\n  \"paid_by\": \"Rahul Sharma\",\n  \"mode_of_payment\": \"UPI\",\n  \"for_property\": [\"Clover Villa\", \"Kitchen\"],\n  \"submitted_by\": \"Anonymous\",\n  \"submitted_at\": \"2026-04-08T18:38:00+05:30\"\n}"
+        },
+        "url": {
+          "raw": "http://localhost:8000/expense",
+          "protocol": "http",
+          "host": [
+            "localhost"
+          ],
+          "port": "8000",
+          "path": [
+            "expense"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Create Income",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"for_property\": [\"Clover Villa\"],\n  \"name\": \"Amit Kumar Sharma\",\n  \"receipt_date\": \"08-04-2026 18:35\",\n  \"booking_number\": \"BK20260408-0456\",\n  \"payment_type\": \"UPI\",\n  \"room_amount\": 4500.00,\n  \"food_amount\": 850.00,\n  \"payment_screenshot\": \"payment_screenshot_20260408_1835.jpg\",\n  \"receipt_by\": \"Rahul Patel\",\n  \"submitted_by\": \"Anonymous\",\n  \"submitted_at\": \"2026-04-08T18:50:00+05:30\"\n}"
+        },
+        "url": {
+          "raw": "http://localhost:8000/income",
+          "protocol": "http",
+          "host": [
+            "localhost"
+          ],
+          "port": "8000",
+          "path": [
+            "income"
+          ]
+        }
+      },
+      "response": []
+    }
+  ]
+}
