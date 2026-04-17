@@ -20,7 +20,7 @@ if "Supabase@8637" in raw_db_url:
 else:
     safe_db_url = raw_db_url
 
-engine = create_engine(safe_db_url)
+engine = create_engine(safe_db_url, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()

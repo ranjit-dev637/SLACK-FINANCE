@@ -1,318 +1,576 @@
 import os
-import sys
+import threading
+from datetime import datetime
+from typing import Any, Optional
+
+from fastapi import FastAPI, Request, UploadFile, File, Depends, HTTPException
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 
+# Slack
+from slack_bolt import App as SlackApp
+from slack_bolt.adapter.fastapi import SlackRequestHandler
+
+# DB
+from database import SessionLocal
+import models
+
+# Load Environment Variables
 load_dotenv()
 
-from datetime import datetime
-from fastapi import FastAPI, Depends, Request, UploadFile, File, Form, Response, HTTPException
-from sqlalchemy.orm import Session
-import database
-from database import engine, get_db, Base
-import models
-from schemas import ExpenseSchema, IncomeSchema
-from slack_bolt.async_app import AsyncApp
-from slack_bolt.adapter.fastapi.async_handler import AsyncSlackRequestHandler
+app = FastAPI(title="Finance API")
 
-# Create the database tables
-Base.metadata.create_all(bind=engine)
+# ==============================
+# DATABASE DEPENDENCY
+# ==============================
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-app = FastAPI(title="Finance Ingestion API")
 
-# Initialize Slack App
-SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+# ==============================
+# UTILS
+# ==============================
+def safe_float(val):
+    try:
+        return float(val) if val else 0.0
+    except (ValueError, TypeError):
+        return 0.0
 
-if not SLACK_BOT_TOKEN or not SLACK_SIGNING_SECRET:
-    print("ERROR: SLACK_BOT_TOKEN and SLACK_SIGNING_SECRET must be set in the .env file.")
-    sys.exit(1)
 
-slack_app = AsyncApp(
-    token=SLACK_BOT_TOKEN,
-    signing_secret=SLACK_SIGNING_SECRET
+# ==============================
+# SLACK APP INIT
+# ==============================
+slack_app = SlackApp(
+    token=os.getenv("SLACK_BOT_TOKEN"),
+    signing_secret=os.getenv("SLACK_SIGNING_SECRET")
 )
-handler = AsyncSlackRequestHandler(slack_app)
 
-@app.post("/expense")
-def create_expense(expense: ExpenseSchema, db: Session = Depends(get_db)):
-    db_data = expense.model_dump()
-    if isinstance(db_data.get("receipt_copy"), str):
-        db_data["receipt_copy"] = None
-        
-    db_expense = models.ExpenseDB(**db_data)
-    db.add(db_expense)
-    db.commit()
-    db.refresh(db_expense)
-    return {
-        "status": "success",
-        "message": "Expense record ingested successfully.",
-        "data": {"id": db_expense.id}
-    }
+handler = SlackRequestHandler(slack_app)
 
-@app.post("/income")
-def create_income(income: IncomeSchema, db: Session = Depends(get_db)):
-    db_data = income.model_dump()
-    if isinstance(db_data.get("payment_screenshot"), str):
-        db_data["payment_screenshot"] = None
-        
-    db_income = models.IncomeDB(**db_data)
-    db.add(db_income)
-    db.commit()
-    db.refresh(db_income)
-    return {
-        "status": "success",
-        "message": "Income record ingested successfully.",
-        "data": {"id": db_income.id}
-    }
+@slack_app.event("message")
+def handle_message_events(body, logger):
+    logger.info("Message Event Received")
+    logger.info(body)
 
-import logging
+# ==============================
+# PROPERTY LIST
+# ==============================
+PROPERTIES = [
+    {"text": {"type": "plain_text", "text": "Clover Villa"}, "value": "Clover Villa"},
+    {"text": {"type": "plain_text", "text": "Clover Woods"}, "value": "Clover Woods"},
+    {"text": {"type": "plain_text", "text": "Clover Connect"}, "value": "Clover Connect"},
+    {"text": {"type": "plain_text", "text": "Clovera"}, "value": "Clovera"},
+]
 
-# Initialize logger for file endpoints
-logger = logging.getLogger(__name__)
 
-@app.post("/expense/{id}/upload-receipt")
-async def upload_expense_receipt(id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
-    try:
-        db_expense = db.query(models.ExpenseDB).filter(models.ExpenseDB.id == id).first()
-        if not db_expense:
-            raise HTTPException(status_code=404, detail="Expense not found")
-            
-        # Safely read bytes from UploadFile spool
-        file_bytes = await file.read()
-        if not file_bytes:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-            
-        db_expense.receipt_copy = file_bytes
-        db.commit()
-        return {"status": "success", "message": f"Receipt '{file.filename}' uploaded successfully."}
-    except HTTPException:
-        raise
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Failed to process receipt upload for expense ID {id}: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error during upload")
+# ==============================
+# PYDANTIC SCHEMAS (Swagger)
+# ==============================
+class ExpenseCreate(BaseModel):
+    expense_name: str
+    seller_name: str
+    total_amount: float
+    gst_amount: float = 0.0
+    purchase_date: Optional[str] = None
+    paid_by: str
+    mode_of_payment: str
+    priority: str = "Medium"
+    for_property: Any 
+    submitted_by: str
 
-@app.post("/income/{id}/upload-screenshot")
-async def upload_income_screenshot(id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
-    try:
-        db_income = db.query(models.IncomeDB).filter(models.IncomeDB.id == id).first()
-        if not db_income:
-            raise HTTPException(status_code=404, detail="Income not found")
-            
-        # Safely read bytes
-        file_bytes = await file.read()
-        if not file_bytes:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-            
-        db_income.payment_screenshot = file_bytes
-        db.commit()
-        return {"status": "success", "message": f"Screenshot '{file.filename}' uploaded successfully."}
-    except HTTPException:
-        raise
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Failed to process screenshot upload for income ID {id}: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error during upload")
 
-@app.get("/expense/{id}/receipt")
-def get_expense_receipt(id: int, db: Session = Depends(get_db)):
-    try:
-        db_expense = db.query(models.ExpenseDB).filter(models.ExpenseDB.id == id).first()
-        if not db_expense or not db_expense.receipt_copy:
-            raise HTTPException(status_code=404, detail="Receipt not found")
-        
-        # Safely resolve content type mapping based on precise magic bytes
-        content_type = "image/jpeg"
-        if len(db_expense.receipt_copy) >= 8 and db_expense.receipt_copy.startswith(b'\x89PNG\r\n\x1a\n'):
-            content_type = "image/png"
-            
-        return Response(content=db_expense.receipt_copy, media_type=content_type)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to fetch receipt for expense ID {id}: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error retrieving file")
+class IncomeCreate(BaseModel):
+    name: str  # customer
+    booking_number: str
+    contact_number: Optional[str] = None
+    captured_date: Optional[str] = None
+    room_amount: float
+    food_amount: float
+    payment_type: str
+    receipt_by: str
+    for_property: Any
+    submitted_by: str
 
-@app.get("/income/{id}/screenshot")
-def get_income_screenshot(id: int, db: Session = Depends(get_db)):
-    try:
-        db_income = db.query(models.IncomeDB).filter(models.IncomeDB.id == id).first()
-        if not db_income or not db_income.payment_screenshot:
-            raise HTTPException(status_code=404, detail="Screenshot not found")
-            
-        content_type = "image/jpeg"
-        if len(db_income.payment_screenshot) >= 8 and db_income.payment_screenshot.startswith(b'\x89PNG\r\n\x1a\n'):
-            content_type = "image/png"
-            
-        return Response(content=db_income.payment_screenshot, media_type=content_type)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to fetch screenshot for income ID {id}: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error retrieving file")
 
+# ==============================
+# SLACK COMMAND: /expense
+# ==============================
 @slack_app.command("/expense")
-async def handle_expense_command(ack, body, client, logger):
-    await ack()
-    try:
-        await client.views_open(
-            trigger_id=body["trigger_id"],
-            view={
-                "type": "modal",
-                "callback_id": "expense_form",
-                "title": { "type": "plain_text", "text": "Submit New Expense" },
-                "submit": { "type": "plain_text", "text": "Submit Expense" },
-                "close": { "type": "plain_text", "text": "Cancel" },
-                "blocks": [
-                    { "type": "input", "block_id": "expense_name", "label": { "type": "plain_text", "text": "Expense Name" }, "element": { "type": "plain_text_input", "action_id": "expense_name", "placeholder": { "type": "plain_text", "text": "Office Stationery Purchase" } } },
-                    { "type": "input", "block_id": "seller_name", "label": { "type": "plain_text", "text": "Seller Name" }, "element": { "type": "plain_text_input", "action_id": "seller_name", "placeholder": { "type": "plain_text", "text": "Stationery World" } } },
-                    { "type": "input", "block_id": "total_amount", "label": { "type": "plain_text", "text": "Total Amount (₹)" }, "element": { "type": "plain_text_input", "action_id": "total_amount", "placeholder": { "type": "plain_text", "text": "2850.00" } } },
-                    { "type": "input", "block_id": "gst_amount", "label": { "type": "plain_text", "text": "GST Amount" }, "element": { "type": "plain_text_input", "action_id": "gst_amount", "placeholder": { "type": "plain_text", "text": "450.00" } } },
-                    { "type": "input", "block_id": "purchase_date", "label": { "type": "plain_text", "text": "Purchase Date" }, "element": { "type": "datepicker", "action_id": "purchase_date" } },
-                    { "type": "input", "block_id": "paid_by", "label": { "type": "plain_text", "text": "Paid By" }, "element": { "type": "plain_text_input", "action_id": "paid_by", "placeholder": { "type": "plain_text", "text": "Rahul Sharma" } } },
-                    { "type": "input", "block_id": "mode_of_payment", "label": { "type": "plain_text", "text": "Mode of Payment" }, "element": { "type": "static_select", "action_id": "mode_of_payment", "options": [
-                    { "text": { "type": "plain_text", "text": "UPI" }, "value": "UPI" },
-                    { "text": { "type": "plain_text", "text": "Cash" }, "value": "Cash" },
-                    { "text": { "type": "plain_text", "text": "Card" }, "value": "Card" }
-                    ] } },
-                    { "type": "input", "block_id": "for_property", "label": { "type": "plain_text", "text": "For Property" }, "element": { "type": "multi_static_select", "action_id": "for_property", "options": [
-                    { "text": { "type": "plain_text", "text": "Clover Villa" }, "value": "Clover Villa" },
-                    { "text": { "type": "plain_text", "text": "Kitchen" }, "value": "Kitchen" }
-                    ] } }
-                ]
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error opening expense modal: {e}")
+def open_expense(ack, body, client):
+    ack()
+    client.views_open(
+        trigger_id=body["trigger_id"],
+        view={
+            "type": "modal",
+            "callback_id": "expense_modal",
+            "title": {"type": "plain_text", "text": "Submit Expense"},
+            "submit": {"type": "plain_text", "text": "Submit"},
+            "blocks": [
+                {
+                    "type": "input",
+                    "block_id": "expense_name",
+                    "element": {"type": "plain_text_input", "action_id": "value"},
+                    "label": {"type": "plain_text", "text": "Expense Name"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "seller_name",
+                    "element": {"type": "plain_text_input", "action_id": "value"},
+                    "label": {"type": "plain_text", "text": "Seller Name"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "total_amount",
+                    "element": {"type": "plain_text_input", "action_id": "value"},
+                    "label": {"type": "plain_text", "text": "Total Amount"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "gst_amount",
+                    "element": {"type": "plain_text_input", "action_id": "value", "initial_value": "0"},
+                    "label": {"type": "plain_text", "text": "GST Amount"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "purchase_date",
+                    "element": {"type": "datepicker", "action_id": "value"},
+                    "label": {"type": "plain_text", "text": "Purchase Date"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "paid_by",
+                    "element": {"type": "plain_text_input", "action_id": "value"},
+                    "label": {"type": "plain_text", "text": "Paid By"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "payment_type",
+                    "element": {
+                        "type": "static_select",
+                        "action_id": "value",
+                        "placeholder": {"type": "plain_text", "text": "Select payment method"},
+                        "options": [
+                            {"text": {"type": "plain_text", "text": "Cash"}, "value": "Cash"},
+                            {"text": {"type": "plain_text", "text": "UPI"}, "value": "UPI"},
+                            {"text": {"type": "plain_text", "text": "Card"}, "value": "Card"}
+                        ]
+                    },
+                    "label": {"type": "plain_text", "text": "Payment Type"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "priority",
+                    "element": {
+                        "type": "static_select",
+                        "action_id": "value",
+                        "options": [
+                            {"text": {"type": "plain_text", "text": "High"}, "value": "High"},
+                            {"text": {"type": "plain_text", "text": "Medium"}, "value": "Medium"},
+                            {"text": {"type": "plain_text", "text": "Low"}, "value": "Low"}
+                        ]
+                    },
+                    "label": {"type": "plain_text", "text": "Priority"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "for_property",
+                    "element": {
+                        "type": "static_select",
+                        "action_id": "value",
+                        "options": PROPERTIES
+                    },
+                    "label": {"type": "plain_text", "text": "Select Property"}
+                }
+            ]
+        }
+    )
 
+
+# ==============================
+# SLACK COMMAND: /income
+# ==============================
 @slack_app.command("/income")
-async def handle_income_command(ack, body, client, logger):
-    await ack()
-    try:
-        await client.views_open(
-            trigger_id=body["trigger_id"],
-            view={
-                "type": "modal",
-                "callback_id": "income_form",
-                "title": { "type": "plain_text", "text": "Submit New Income" },
-                "submit": { "type": "plain_text", "text": "Submit Income" },
-                "close": { "type": "plain_text", "text": "Cancel" },
-                "blocks": [
-                    { "type": "input", "block_id": "for_property", "label": { "type": "plain_text", "text": "For Property" }, "element": { "type": "multi_static_select", "action_id": "for_property", "options": [
-                    { "text": { "type": "plain_text", "text": "Clover Villa" }, "value": "Clover Villa" },
-                    { "text": { "type": "plain_text", "text": "Kitchen" }, "value": "Kitchen" }
-                    ] } },
-                    { "type": "input", "block_id": "name", "label": { "type": "plain_text", "text": "Customer Name" }, "element": { "type": "plain_text_input", "action_id": "name", "placeholder": { "type": "plain_text", "text": "John Doe" } } },
-                    { "type": "input", "block_id": "receipt_date", "label": { "type": "plain_text", "text": "Receipt Date" }, "element": { "type": "datepicker", "action_id": "receipt_date" } },
-                    { "type": "input", "block_id": "booking_number", "label": { "type": "plain_text", "text": "Booking Number" }, "element": { "type": "plain_text_input", "action_id": "booking_number", "placeholder": { "type": "plain_text", "text": "BKG-101" } } },
-                    { "type": "input", "block_id": "room_amount", "label": { "type": "plain_text", "text": "Room Amount (₹)" }, "element": { "type": "plain_text_input", "action_id": "room_amount" } },
-                    { "type": "input", "block_id": "food_amount", "label": { "type": "plain_text", "text": "Food Amount (₹)" }, "element": { "type": "plain_text_input", "action_id": "food_amount" } },
-                    { "type": "input", "block_id": "payment_type", "label": { "type": "plain_text", "text": "Payment Type" }, "element": { "type": "static_select", "action_id": "payment_type", "options": [
-                    { "text": { "type": "plain_text", "text": "UPI" }, "value": "UPI" },
-                    { "text": { "type": "plain_text", "text": "Cash" }, "value": "Cash" },
-                    { "text": { "type": "plain_text", "text": "Card" }, "value": "Card" }
-                    ] } },
-                    { "type": "input", "block_id": "receipt_by", "label": { "type": "plain_text", "text": "Receipt By" }, "element": { "type": "plain_text_input", "action_id": "receipt_by" } }
-                ]
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error opening income modal: {e}")
+def open_income(ack, body, client):
+    ack()
+    client.views_open(
+        trigger_id=body["trigger_id"],
+        view={
+            "type": "modal",
+            "callback_id": "income_modal",
+            "title": {"type": "plain_text", "text": "Submit Income"},
+            "submit": {"type": "plain_text", "text": "Submit"},
+            "blocks": [
+                {
+                    "type": "input",
+                    "block_id": "name",
+                    "element": {"type": "plain_text_input", "action_id": "value"},
+                    "label": {"type": "plain_text", "text": "Customer Name"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "booking_number",
+                    "element": {"type": "plain_text_input", "action_id": "value"},
+                    "label": {"type": "plain_text", "text": "Booking Number"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "contact_number",
+                    "element": {"type": "plain_text_input", "action_id": "value"},
+                    "label": {"type": "plain_text", "text": "Contact Number"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "captured_date",
+                    "optional": True,
+                    "element": {"type": "datepicker", "action_id": "value"},
+                    "label": {"type": "plain_text", "text": "Captured Date"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "room_amount",
+                    "element": {"type": "plain_text_input", "action_id": "value"},
+                    "label": {"type": "plain_text", "text": "Room Amount"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "food_amount",
+                    "element": {"type": "plain_text_input", "action_id": "value", "initial_value": "0"},
+                    "label": {"type": "plain_text", "text": "Food Amount"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "payment_type",
+                    "element": {
+                        "type": "static_select",
+                        "action_id": "value",
+                        "placeholder": {"type": "plain_text", "text": "Select payment method"},
+                        "options": [
+                            {"text": {"type": "plain_text", "text": "Cash"}, "value": "Cash"},
+                            {"text": {"type": "plain_text", "text": "UPI"}, "value": "UPI"},
+                            {"text": {"type": "plain_text", "text": "Card"}, "value": "Card"}
+                        ]
+                    },
+                    "label": {"type": "plain_text", "text": "Payment Type"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "receipt_by",
+                    "element": {"type": "plain_text_input", "action_id": "value"},
+                    "label": {"type": "plain_text", "text": "Receipt By"}
+                },
+                {
+                    "type": "input",
+                    "block_id": "for_property",
+                    "element": {
+                        "type": "static_select",
+                        "action_id": "value",
+                        "options": PROPERTIES
+                    },
+                    "label": {"type": "plain_text", "text": "Select Property"}
+                }
+            ]
+        }
+    )
 
-@slack_app.view("expense_form")
-async def handle_expense_submission(ack, body, client, view, logger):
-    await ack()
-    user = body["user"]["id"]
-    values = view["state"]["values"]
+
+# ==============================
+# SUBMIT HANDLER: EXPENSE
+# ==============================
+@slack_app.view("expense_modal")
+def handle_expense_modal(ack, body, client):
+    # Immediate ACK to prevent Slack app timeout
+    ack()
     
-    try:
-        # Extract inputs
-        expense_name = values["expense_name"]["expense_name"]["value"]
-        seller_name = values["seller_name"]["seller_name"]["value"]
-        total_amount = float(values["total_amount"]["total_amount"]["value"])
-        gst_amount = float(values["gst_amount"]["gst_amount"]["value"])
-        purchase_date_str = values["purchase_date"]["purchase_date"]["selected_date"]
-        purchase_date = datetime.strptime(purchase_date_str, "%Y-%m-%d").date()
-        paid_by = values["paid_by"]["paid_by"]["value"]
-        mode_of_payment = values["mode_of_payment"]["mode_of_payment"]["selected_option"]["value"]
-        for_property = [option["value"] for option in values["for_property"]["for_property"]["selected_options"]]
+    def background_task():
+        values = body["view"]["state"]["values"]
+        user_id = body["user"]["id"]
+        user_name = body["user"]["username"]
         
-        # Build Pydantic schema
-        expense_data = ExpenseSchema(
-            expense_name=expense_name, seller_name=seller_name,
-            gst_amount=gst_amount, total_amount=total_amount, purchase_date=purchase_date,
-            priority="Normal", paid_by=paid_by, mode_of_payment=mode_of_payment,
-            for_property=for_property, submitted_by=f"<@{user}>", submitted_at=datetime.utcnow()
+        try:
+            expense_name = values["expense_name"]["value"]["value"]
+            seller_name = values["seller_name"]["value"]["value"]
+            total_amount = safe_float(values["total_amount"]["value"]["value"])
+            gst_amount = safe_float(values["gst_amount"]["value"]["value"])
+            
+            purchase_date_str = values["purchase_date"]["value"]["selected_date"]
+            purchase_date = datetime.strptime(purchase_date_str, "%Y-%m-%d").date()
+            
+            paid_by = values["paid_by"]["value"]["value"]
+            mode_of_payment = values["payment_type"]["value"]["selected_option"]["value"]
+            priority = values["priority"]["value"]["selected_option"]["value"]
+            property_name = values["for_property"]["value"]["selected_option"]["value"]
+            
+            db = SessionLocal()
+            try:
+                new_expense = models.Expense(
+                    expense_name=expense_name,
+                    seller_name=seller_name,
+                    total_amount=total_amount,
+                    gst_amount=gst_amount,
+                    purchase_date=purchase_date,
+                    paid_by=paid_by,
+                    mode_of_payment=mode_of_payment,
+                    priority=priority,
+                    for_property={"name": property_name},
+                    submitted_by=user_name,
+                    submitted_at=datetime.now()
+                )
+                db.add(new_expense)
+                db.commit()
+                
+                try:
+                    client.chat_postMessage(
+                        channel=user_id,
+                        text=f"✅ Expense recorded: ₹{total_amount} for {property_name}"
+                    )
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    client.chat_postMessage(
+                        channel=user_id,
+                        text=f"❌ Failed to save expense in database. Error: {str(e)}"
+                    )
+                except Exception:
+                    pass
+            finally:
+                db.close()
+                
+        except Exception as e:
+            try:
+                client.chat_postMessage(channel=user_id, text=f"❌ Error processing modal fields: {str(e)}")
+            except Exception:
+                pass
+
+    threading.Thread(target=background_task).start()
+
+
+# ==============================
+# SUBMIT HANDLER: INCOME
+# ==============================
+@slack_app.view("income_modal")
+def handle_income_modal(ack, body, client):
+    # Immediate ACK to prevent Slack app timeout
+    ack()
+    
+    def background_task():
+        values = body["view"]["state"]["values"]
+        user_id = body["user"]["id"]
+        user_name = body["user"]["username"]
+        
+        try:
+            name = values["name"]["value"]["value"]
+            booking_number = values["booking_number"]["value"]["value"]
+            contact_number = values["contact_number"]["value"]["value"]
+            
+            captured_date = values["captured_date"]["value"]["selected_date"]
+            if not captured_date:
+                captured_date = datetime.now().strftime("%Y-%m-%d")
+            
+            room_amount = safe_float(values["room_amount"]["value"]["value"])
+            food_amount = safe_float(values["food_amount"]["value"]["value"])
+            payment_type = values["payment_type"]["value"]["selected_option"]["value"]
+            receipt_by = values["receipt_by"]["value"]["value"]
+            property_name = values["for_property"]["value"]["selected_option"]["value"]
+            
+            total_amount = room_amount + food_amount
+            
+            db = SessionLocal()
+            try:
+                new_income = models.Income(
+                    name=name,
+                    booking_number=booking_number,
+                    contact_number=contact_number,
+                    captured_date=captured_date,
+                    room_amount=room_amount,
+                    food_amount=food_amount,
+                    payment_type=payment_type,
+                    receipt_by=receipt_by,
+                    for_property={"name": property_name},
+                    submitted_by=user_name,
+                    submitted_at=datetime.now()
+                )
+                db.add(new_income)
+                db.commit()
+                
+                try:
+                    client.chat_postMessage(
+                        channel=user_id,
+                        text=f"✅ Income recorded: ₹{total_amount} from {name} ({property_name})"
+                    )
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    client.chat_postMessage(
+                        channel=user_id,
+                        text=f"❌ Failed to save income in database. Error: {str(e)}"
+                    )
+                except Exception:
+                    pass
+            finally:
+                db.close()
+                
+        except Exception as e:
+            try:
+                client.chat_postMessage(channel=user_id, text=f"❌ Error processing modal fields: {str(e)}")
+            except Exception:
+                pass
+
+    threading.Thread(target=background_task).start()
+
+
+# ==============================
+# SLACK EVENTS ENDPOINT
+# ==============================
+@app.post("/slack/events", summary="Slack Events webhook endpoint")
+async def slack_events(request: Request):
+    try:
+        body = await request.json()
+        if body.get("type") == "url_verification":
+            return {"challenge": body.get("challenge")}
+    except Exception:
+        pass
+
+    return await handler.handle(request)
+
+
+# ==============================
+# CREATE EXPENSE (API)
+# ==============================
+@app.post("/expense", summary="Create a new expense entry")
+def create_expense(expense: ExpenseCreate, db: Session = Depends(get_db)):
+    try:
+        prop_data = expense.for_property if isinstance(expense.for_property, dict) else {"name": expense.for_property}
+        
+        purchase_date = datetime.now().date()
+        if expense.purchase_date:
+            try:
+                purchase_date = datetime.strptime(expense.purchase_date, "%Y-%m-%d").date()
+            except Exception:
+                pass
+            
+        new_expense = models.Expense(
+            expense_name=expense.expense_name,
+            seller_name=expense.seller_name,
+            total_amount=expense.total_amount,
+            gst_amount=expense.gst_amount,
+            purchase_date=purchase_date,
+            paid_by=expense.paid_by,
+            mode_of_payment=expense.mode_of_payment,
+            priority=expense.priority,
+            for_property=prop_data,
+            submitted_by=expense.submitted_by,
+            submitted_at=datetime.now()
+        )
+
+        db.add(new_expense)
+        db.commit()
+        db.refresh(new_expense)
+
+        return {"status": "success", "id": new_expense.id}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ==============================
+# CREATE INCOME (API)
+# ==============================
+@app.post("/income", summary="Create a new income entry")
+def create_income(income: IncomeCreate, db: Session = Depends(get_db)):
+    try:
+        prop_data = income.for_property if isinstance(income.for_property, dict) else {"name": income.for_property}
+        
+        captured_date = income.captured_date
+        if not captured_date:
+            captured_date = datetime.now().strftime("%Y-%m-%d")
+        
+        new_income = models.Income(
+            name=income.name,
+            booking_number=income.booking_number,
+            contact_number=income.contact_number,
+            captured_date=captured_date,
+            room_amount=income.room_amount,
+            food_amount=income.food_amount,
+            payment_type=income.payment_type,
+            receipt_by=income.receipt_by,
+            for_property=prop_data,
+            submitted_by=income.submitted_by,
+            submitted_at=datetime.now()
         )
         
-        # Save to DB correctly
-        db = database.SessionLocal()
-        try:
-            db_data = expense_data.model_dump()
-            if isinstance(db_data.get("receipt_copy"), str):
-                db_data["receipt_copy"] = None
-            db_expense = models.ExpenseDB(**db_data)
-            db.add(db_expense)
-            db.commit()
-            db.refresh(db_expense)
-            logger.info(f"Successfully saved expense {db_expense.id} to DB.")
-        except Exception as db_err:
-            db.rollback()
-            raise db_err
-        finally:
-            db.close()
+        db.add(new_income)
+        db.commit()
+        db.refresh(new_income)
+
+        return {"status": "success", "id": new_income.id}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ==============================
+# FILE UPLOAD (EXPENSE)
+# ==============================
+@app.post("/expense/{id}/upload-receipt", summary="Upload receipt image for an expense")
+async def upload_receipt(id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    data = await file.read()
+    expense = db.query(models.Expense).filter(models.Expense.id == id).first()
+    if not expense:
+        raise HTTPException(status_code=404, detail="Expense not found")
         
-        await client.chat_postMessage(channel=user, text=f"✅ Successfully registered expense: *{expense_name}* for ₹{total_amount}.")
-    except Exception as e:
-        logger.error(f"Error handling expense submission: {e}")
-        await client.chat_postMessage(channel=user, text=f"❌ Failed to submit expense. Error: {e}")
+    expense.receipt_copy = data
+    db.commit()
+    return {"status": "success", "message": "Receipt uploaded"}
 
-@slack_app.view("income_form")
-async def handle_income_submission(ack, body, client, view, logger):
-    await ack()
-    user = body["user"]["id"]
-    values = view["state"]["values"]
 
-    try:
-        # Extract inputs
-        name = values["name"]["name"]["value"]
-        receipt_date = values["receipt_date"]["receipt_date"]["selected_date"]
-        booking_number = values["booking_number"]["booking_number"]["value"]
-        room_amount = float(values["room_amount"]["room_amount"]["value"])
-        food_amount = float(values["food_amount"]["food_amount"]["value"])
-        payment_type = values["payment_type"]["payment_type"]["selected_option"]["value"]
-        receipt_by = values["receipt_by"]["receipt_by"]["value"]
-        for_property = [option["value"] for option in values["for_property"]["for_property"]["selected_options"]]
+# ==============================
+# GET RECEIPT
+# ==============================
+@app.get("/expense/{id}/receipt", summary="Get receipt image for an expense")
+def get_receipt(id: int, db: Session = Depends(get_db)):
+    expense = db.query(models.Expense).filter(models.Expense.id == id).first()
+    if not expense or not expense.receipt_copy:
+        raise HTTPException(status_code=404, detail="Receipt not found")
 
-        # Build schema ensuring receipt_date is passed as a valid string
-        income_data = IncomeSchema(
-            for_property=for_property, name=name, receipt_date=str(receipt_date),
-            booking_number=booking_number, payment_type=payment_type, room_amount=room_amount,
-            food_amount=food_amount, receipt_by=receipt_by, submitted_by=f"<@{user}>", submitted_at=datetime.utcnow()
-        )
+    return Response(
+        content=expense.receipt_copy,
+        media_type="image/jpeg"
+    )
 
-        # Save to DB correctly
-        db = database.SessionLocal()
-        try:
-            db_data = income_data.model_dump()
-            if isinstance(db_data.get("payment_screenshot"), str):
-                db_data["payment_screenshot"] = None
-            db_income = models.IncomeDB(**db_data)
-            db.add(db_income)
-            db.commit()
-            db.refresh(db_income)
-            logger.info(f"Successfully saved income {db_income.id} to DB.")
-        except Exception as db_err:
-            db.rollback()
-            raise db_err
-        finally:
-            db.close()
 
-        await client.chat_postMessage(channel=user, text=f"✅ Successfully registered income from *{name}* for BKG *{booking_number}*.")
-    except Exception as e:
-        logger.error(f"Error handling income submission: {e}")
-        await client.chat_postMessage(channel=user, text=f"❌ Failed to submit income. Error: {e}")
+# ==============================
+# UPLOAD INCOME SCREENSHOT
+# ==============================
+@app.post("/income/{id}/upload-screenshot", summary="Upload screenshot image for an income")
+async def upload_income_screenshot(id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    data = await file.read()
+    income = db.query(models.Income).filter(models.Income.id == id).first()
+    if not income:
+        raise HTTPException(status_code=404, detail="Income not found")
+        
+    income.payment_screenshot = data
+    db.commit()
+    return {"status": "success", "message": "Screenshot uploaded"}
 
-@app.post("/slack/events")
-async def endpoint(req: Request):
-    return await handler.handle(req)
+
+# ==============================
+# GET INCOME SCREENSHOT
+# ==============================
+@app.get("/income/{id}/screenshot", summary="Get screenshot image for an income")
+def get_income_screenshot(id: int, db: Session = Depends(get_db)):
+    income = db.query(models.Income).filter(models.Income.id == id).first()
+    if not income or not income.payment_screenshot:
+        raise HTTPException(status_code=404, detail="Screenshot not found")
+
+    return Response(
+        content=income.payment_screenshot,
+        media_type="image/jpeg"
+    )
