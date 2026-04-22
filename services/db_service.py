@@ -143,14 +143,14 @@ def get_pending_income(user_id: str):
 # ══════════════════════════════════════════════════════════════════════════════
 # INCOME — ATTACH SCREENSHOT & MARK COMPLETED
 # ══════════════════════════════════════════════════════════════════════════════
-def complete_income_with_screenshot(transaction_id: str, file_bytes: bytes) -> bool:
+def complete_income_with_screenshot(transaction_id: str, file_url: str) -> bool:
     """
-    Attaches screenshot bytes to an existing PENDING income record and marks
+    Links a Supabase Storage URL to an existing PENDING income record and marks
     it as COMPLETED — identified strictly by transaction_id.
 
     Equivalent SQL:
         UPDATE incomes
-        SET payment_screenshot = <file_bytes>,
+        SET payment_screenshot = '<url>',
             status = 'COMPLETED'
         WHERE transaction_id = '<transaction_id>'
           AND status = 'PENDING';
@@ -175,7 +175,7 @@ def complete_income_with_screenshot(transaction_id: str, file_bytes: bytes) -> b
             )
             return False
 
-        record.payment_screenshot = file_bytes
+        record.payment_screenshot = file_url
         record.status = "COMPLETED"
         db.commit()
         logger.info(f"Income completed | txn={transaction_id} | db_id={record.id}")
@@ -271,14 +271,14 @@ def get_pending_expense(user_id: str):
 # ══════════════════════════════════════════════════════════════════════════════
 # EXPENSE — ATTACH RECEIPT & MARK COMPLETED
 # ══════════════════════════════════════════════════════════════════════════════
-def complete_expense_with_receipt(transaction_id: str, file_bytes: bytes) -> bool:
+def complete_expense_with_receipt(transaction_id: str, file_url: str) -> bool:
     """
-    Attaches receipt bytes to an existing PENDING expense record and marks
+    Links a Supabase Storage URL to an existing PENDING expense record and marks
     it as COMPLETED — identified strictly by transaction_id.
 
     Equivalent SQL:
         UPDATE expenses
-        SET receipt_copy = <file_bytes>,
+        SET receipt_copy = '<url>',
             status = 'COMPLETED'
         WHERE transaction_id = '<transaction_id>'
           AND status = 'PENDING';
@@ -303,7 +303,7 @@ def complete_expense_with_receipt(transaction_id: str, file_bytes: bytes) -> boo
             )
             return False
 
-        record.receipt_copy = file_bytes
+        record.receipt_copy = file_url
         record.status = "COMPLETED"
         db.commit()
         logger.info(

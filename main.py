@@ -34,9 +34,16 @@ from services.db_service import (
 )
 from services.validation import validate_income_data
 from services.file_handler import process_income_file
+from services.supabase_storage import upload_file_to_storage
 
 # Load Environment Variables
 load_dotenv()
+
+# ==============================
+# FILE VALIDATION CONSTANTS
+# ==============================
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+ALLOWED_TYPES = ["image/jpeg", "image/png", "application/pdf"]
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
@@ -97,14 +104,7 @@ def handle_message_events(body, logger, client):
             return
 
         file = event["files"][0]
-
-        # ── Gate: must be an image ────────────────────────────────────────
-        if not file.get("mimetype", "").startswith("image/"):
-            client.chat_postMessage(
-                channel=user_id,
-                text="❌ Please upload a valid image file (PNG / JPEG)."
-            )
-            return
+        mime_type = file.get("mimetype", "")
 
         # ── Step 1: check for pending INCOME first ──────────────────────
         pending_income = None
@@ -144,11 +144,28 @@ def handle_message_events(body, logger, client):
             record_type = "expense"
             expense_db.close()
 
-        # ── Step 3: Download file from Slack ───────────────────────────
-        headers = {"Authorization": f"Bearer {os.getenv('SLACK_BOT_TOKEN')}"}
+        # ── Step 3: Download file from Slack (binary, streamed) ────────
+        slack_token = os.getenv("SLACK_BOT_TOKEN")
+        # Prefer url_private_download (direct binary); fall back to url_private
+        download_url = file.get("url_private_download") or file.get("url_private")
+        logger.info(f"Downloading Slack file | url={download_url}")
         try:
-            response = requests.get(file["url_private"], headers=headers, timeout=15)
-            response.raise_for_status()
+            response = requests.get(
+                download_url,
+                headers={"Authorization": f"Bearer {slack_token}"},
+                stream=True,   # ensures raw binary transfer, no auto-decoding
+                timeout=15,
+            )
+            if response.status_code != 200:
+                raise Exception(f"Slack download failed: {response.status_code}")
+
+            content_type = response.headers.get("Content-Type", "")
+            if "text/html" in content_type:
+                raise Exception(
+                    "Slack returned HTML instead of file (invalid auth or URL)"
+                )
+
+            file_bytes = response.content  # raw bytes — never decoded, never stringified
         except Exception as e:
             logger.error(f"Failed to download file from Slack: {e}")
             client.chat_postMessage(
@@ -157,23 +174,59 @@ def handle_message_events(body, logger, client):
             )
             return
 
-        file_bytes = response.content
+        # ── Integrity check: reject empty / truncated downloads ─────────
+        if not file_bytes or len(file_bytes) < 100:
+            logger.error(f"Downloaded file is empty or corrupted | url={download_url}")
+            client.chat_postMessage(
+                channel=user_id,
+                text="❌ File download was empty or corrupted. Please try uploading again."
+            )
+            return
 
-        # ── Step 4: Attach file & mark COMPLETED in Supabase ─────────────
+        # ── Validate: file size (≤5 MB) ────────────────────────────────
+        if len(file_bytes) > MAX_FILE_SIZE:
+            client.chat_postMessage(
+                channel=user_id,
+                text="❌ File too large. Please upload a file under 5 MB."
+            )
+            return
+
+        # ── Validate: MIME type ────────────────────────────────────────
+        if mime_type not in ALLOWED_TYPES:
+            client.chat_postMessage(
+                channel=user_id,
+                text="❌ Invalid file type. Only JPG, PNG, PDF allowed."
+            )
+            return
+
+        # ── Step 4: Upload to Supabase Storage → get public URL ───────────
+        try:
+            file_url = upload_file_to_storage(
+                transaction_id=transaction_id,
+                file_bytes=file_bytes,
+                mime_type=mime_type,
+            )
+        except Exception as e:
+            logger.error(f"Supabase Storage upload failed | txn={transaction_id}: {e}")
+            client.chat_postMessage(
+                channel=user_id,
+                text=f"❌ File upload to storage failed: {str(e)}"
+            )
+            return
+
+        # ── Step 5: Save URL in DB & mark COMPLETED ──────────────────────
         try:
             if record_type == "income":
-                success = complete_income_with_screenshot(transaction_id, file_bytes)
-                label = "Payment screenshot"
+                success = complete_income_with_screenshot(transaction_id, file_url)
                 entity = "Income"
             else:
-                success = complete_expense_with_receipt(transaction_id, file_bytes)
-                label = "Receipt"
+                success = complete_expense_with_receipt(transaction_id, file_url)
                 entity = "Expense"
         except Exception as e:
             logger.error(f"DB error completing {record_type} txn={transaction_id}: {e}")
             client.chat_postMessage(
                 channel=user_id,
-                text=f"❌ Database error while saving file: {str(e)}"
+                text=f"❌ Database error while saving file reference: {str(e)}"
             )
             return
 
@@ -291,9 +344,10 @@ class TransactionCreate(BaseModel):
 # SLACK COMMAND: /expense
 # ==============================
 @slack_app.command("/expense")
-def open_expense(ack, body, client):
+def open_expense(ack, body, client, logger):
     ack()
-    client.views_open(
+    try:
+        client.views_open(
         trigger_id=body["trigger_id"],
         view={
             "type": "modal",
@@ -397,19 +451,22 @@ def open_expense(ack, body, client):
             ]
         }
     )
+    except Exception as e:
+        logger.error(f"Failed to open /expense modal: {str(e)}")
 
 
 # ==============================
 # SLACK COMMAND: /income
 # ==============================
 @slack_app.command("/income")
-def open_income(ack, body, client):
+def open_income(ack, body, client, logger):
     ack()
-    client.views_open(
+    try:
+        client.views_open(
         trigger_id=body["trigger_id"],
         view={
             "type": "modal",
-            "callback_id": "submit_income_modal",
+            "callback_id": "income_modal",
             "title": {"type": "plain_text", "text": "Submit Income"},
             "submit": {"type": "plain_text", "text": "Submit"},
             "blocks": [
@@ -475,7 +532,7 @@ def open_income(ack, body, client):
                 {
                     "type": "input",
                     "block_id": "receipt_date",
-                    "optional": true,
+                    "optional": True,
                     "element": {
                         "type": "datepicker",
                         "action_id": "receipt_date_input",
@@ -486,280 +543,242 @@ def open_income(ack, body, client):
             ]
         }
     )
+    except Exception as e:
+        logger.error(f"Failed to open /income modal: {str(e)}")
 
 
 # ==============================
 # SUBMIT HANDLER: EXPENSE
 # ==============================
 @slack_app.view("expense_modal")
-def handle_expense_modal(ack, body, client):
-    """
-    Handles /expense modal submission.
-
-    Flow:
-      1. Validate fields inline — return errors if invalid.
-      2. ACK immediately to prevent Slack 3-second timeout.
-      3. Spawn background thread to:
-           a. Generate unique EXP-XXXXXXXX transaction_id.
-           b. Insert PENDING record into Supabase (receipt_copy = NULL).
-           c. Prompt user to upload the receipt image via DM.
-    """
-    state_values = body["view"]["state"]["values"]
-    user_id   = body["user"]["id"]
-    user_name = body["user"]["username"]
-
-    logger.info(f"Expense modal submitted by user_id={user_id}")
-
-    # ── Extract fields ────────────────────────────────────────────────
-    try:
-        expense_name    = state_values["expense_name_block"]["expense_name"]["value"]
-        seller_name     = state_values["seller_name_block"]["seller_name"]["value"]
-        gst_amount_str  = state_values["gst_amount_block"]["gst_amount"]["value"]
-        total_amount_str = state_values["total_amount_block"]["total_amount"]["value"]
-        purchase_date_str = state_values["purchase_date_block"]["purchase_date_input"]["selected_date"]
-        priority        = state_values["priority_block"]["priority"]["selected_option"]["value"]
-        paid_by         = state_values["paid_by_block"]["paid_by"]["value"]
-        mode_of_payment = state_values["mode_of_payment_block"]["mode_of_payment"]["selected_option"]["value"]
-        property_name   = state_values["property_block"]["property"]["selected_option"]["value"]
-    except KeyError as e:
-        logger.error(f"Expense modal field extraction error: {e}")
-        ack(response_action="errors", errors={"expense_name_block": "Unexpected field error — please retry."})
-        return
-
-    # ── Inline validation ──────────────────────────────────────────────
-    errors = {}
-    num_regex = re.compile(r"^\d+(\.\d+)?$")
-
-    if not expense_name or not expense_name.strip():
-        errors["expense_name_block"] = "Expense name is required"
-
-    if not seller_name or not seller_name.strip():
-        errors["seller_name_block"] = "Seller name is required"
-
-    if not gst_amount_str or not num_regex.match(gst_amount_str.strip()):
-        errors["gst_amount_block"] = "Must be a valid number (e.g. 0 or 150.50)"
-
-    if not total_amount_str or not num_regex.match(total_amount_str.strip()):
-        errors["total_amount_block"] = "Must be a valid number (e.g. 1500)"
-
-    if not paid_by or not paid_by.strip():
-        errors["paid_by_block"] = "Paid By is required"
-
-    if not purchase_date_str:
-        errors["purchase_date_block"] = "Purchase date is required"
-
-    if errors:
-        ack(response_action="errors", errors=errors)
-        return
-
-    # ── ACK immediately — prevents Slack 3-second timeout ───────────────
+def handle_expense_modal(ack, body, client, logger):
     ack()
 
-    # ── Background thread: DB insert → Slack prompt ───────────────────
-    def _save_pending_expense():
+    def _process_expense():
+        logger.info("THREAD STARTED")
         try:
-            purchase_date_obj = datetime.strptime(purchase_date_str, "%Y-%m-%d").date()
-        except Exception:
-            purchase_date_obj = datetime.now().date()
+            user_id      = body.get("user", {}).get("id")
+            state_values = body.get("view", {}).get("state", {}).get("values", {})
+            # Extract
+            expense_name     = state_values["expense_name_block"]["expense_name"]["value"]
+            seller_name      = state_values["seller_name_block"]["seller_name"]["value"]
+            gst_amount_str   = state_values["gst_amount_block"]["gst_amount"]["value"]
+            total_amount_str = state_values["total_amount_block"]["total_amount"]["value"]
+            purchase_date_str = state_values["purchase_date_block"]["purchase_date_input"]["selected_date"]
+            priority         = state_values["priority_block"]["priority"]["selected_option"]["value"]
+            paid_by          = state_values["paid_by_block"]["paid_by"]["value"]
+            mode_of_payment  = state_values["mode_of_payment_block"]["mode_of_payment"]["selected_option"]["value"]
+            property_name    = state_values["property_block"]["property"]["selected_option"]["value"]
 
-        data = {
-            "user_id":         user_id,
-            "expense_name":    expense_name.strip(),
-            "seller_name":     seller_name.strip(),
-            "gst_amount":      float(gst_amount_str.strip()),
-            "total_amount":    float(total_amount_str.strip()),
-            "purchase_date":   purchase_date_obj,
-            "priority":        priority,
-            "paid_by":         paid_by.strip(),
-            "mode_of_payment": mode_of_payment,
-            "property_name":   property_name,
-        }
+            # Validate
+            num_regex = re.compile(r"^\d+(\.\d+)?$")
+            errs = []
+            if not expense_name or not expense_name.strip():
+                errs.append("Expense name is required.")
+            if not seller_name or not seller_name.strip():
+                errs.append("Seller name is required.")
+            if not gst_amount_str or not num_regex.match(gst_amount_str.strip()):
+                errs.append("GST Amount must be a valid number (e.g. 0 or 150.50).")
+            if not total_amount_str or not num_regex.match(total_amount_str.strip()):
+                errs.append("Total Amount must be a valid number (e.g. 1500).")
+            if not paid_by or not paid_by.strip():
+                errs.append("Paid By is required.")
+            if not purchase_date_str:
+                errs.append("Purchase date is required.")
+            if errs:
+                client.chat_postMessage(
+                    channel=user_id,
+                    text="\u274c Expense submission failed:\n" + "\n".join(f"\u2022 {e}" for e in errs)
+                )
+                return
 
-        try:
+            # Parse date
+            try:
+                purchase_date_obj = datetime.strptime(purchase_date_str, "%Y-%m-%d").date()
+            except Exception:
+                purchase_date_obj = datetime.now().date()
+
+            data = {
+                "user_id":         user_id,
+                "expense_name":    expense_name.strip(),
+                "seller_name":     seller_name.strip(),
+                "gst_amount":      float(gst_amount_str.strip()),
+                "total_amount":    float(total_amount_str.strip()),
+                "purchase_date":   purchase_date_obj,
+                "priority":        priority,
+                "paid_by":         paid_by.strip(),
+                "mode_of_payment": mode_of_payment,
+                "property_name":   property_name,
+            }
+
             transaction_id = insert_expense_record(data)
+            logger.info(f"PENDING expense created | txn={transaction_id} | user={user_id}")
 
             client.chat_postMessage(
                 channel=user_id,
                 text=(
-                    f"✅ Expense submitted successfully.\n"
+                    f"\u2705 Expense submitted successfully.\n"
                     f"Transaction ID: `{transaction_id}`\n"
-                    "📎 Please upload the *receipt screenshot* to complete the submission."
+                    "\U0001f4ce Please upload the *receipt screenshot* to complete the submission."
                 )
             )
+            logger.info("THREAD COMPLETED")  # trace
         except Exception as e:
-            logger.error(f"DB error creating PENDING expense: {e}")
+            logger.error(f"Thread crash: {str(e)}")
             try:
-                client.chat_postMessage(
-                    channel=user_id,
-                    text=f"❌ Database error while saving your expense: {str(e)}"
-                )
+                user_id = body.get("user", {}).get("id")
+                if user_id:
+                    client.chat_postMessage(
+                        channel=user_id,
+                        text=f"\u274c An error occurred while saving your expense: {str(e)}"
+                    )
             except Exception:
                 pass
 
-    threading.Thread(target=_save_pending_expense, daemon=True).start()
+    threading.Thread(target=_process_expense, daemon=True).start()
 
 
 
 # ==============================
 # SUBMIT HANDLER: INCOME
 # ==============================
-@slack_app.view("submit_income_modal")
-def handle_income_modal(ack, body, client):
-    """
-    Handles /income modal submission.
-
-    Flow:
-      1. Validate fields — return errors inline if invalid.
-      2. ACK immediately to prevent Slack 3-second timeout.
-      3. Spawn background thread to:
-           a. Generate unique transaction_id.
-           b. Insert PENDING record into Supabase (payment_screenshot = NULL).
-           c. Prompt user to upload the screenshot via DM.
-    """
-    view = body.get("view", {})
-    state_values = view.get("state", {}).get("values", {})
-
-    user_id = body["user"]["id"]
-    user_name = body["user"]["username"]
-
-    logger.info(f"Income modal submitted by user_id={user_id}")
-
-    # ── Extract fields ─────────────────────────────────────────────────────
-    try:
-        name            = state_values["name_block"]["name"]["value"]
-        booking_number  = state_values["booking_block"]["booking"]["value"]
-        room_amount_str = state_values["room_block"]["room"]["value"]
-        food_amount_str = state_values["food_block"]["food"]["value"]
-        receipt_by      = state_values["receipt_block"]["receipt"]["value"]
-        receipt_date    = (
-            state_values
-            .get("receipt_date", {})
-            .get("receipt_date_input", {})
-            .get("selected_date")
-        )
-    except KeyError as e:
-        logger.error(f"Modal field extraction error: {e}")
-        ack(response_action="errors", errors={"name_block": "Unexpected field error — please retry."})
-        return
-
-    # ── Inline validation (returned to Slack modal) ────────────────────────
-    errors = {}
-    alpha_regex = re.compile(r"^[A-Za-z\s]+$")
-
-    if not name or not alpha_regex.match(name):
-        errors["name_block"] = "Only alphabets allowed"
-
-    if not booking_number or not booking_number.isdigit():
-        errors["booking_block"] = "Only numbers allowed"
-
-    if not room_amount_str or not room_amount_str.isdigit() or int(room_amount_str) <= 0:
-        errors["room_block"] = "Must be a positive number"
-
-    if not food_amount_str or not food_amount_str.isdigit() or int(food_amount_str) < 0:
-        errors["food_block"] = "Must be a non-negative number"
-
-    if not receipt_by or not alpha_regex.match(receipt_by):
-        errors["receipt_block"] = "Only alphabets allowed"
-
-    # receipt_date is optional — datepicker returns None if not selected,
-    # and always returns YYYY-MM-DD when selected, so no format validation needed.
-
-    if errors:
-        ack(response_action="errors", errors=errors)
-        return
-
-    # ── ACK immediately — prevents Slack 3-second timeout ─────────────────
+@slack_app.view("income_modal")
+def handle_income_modal(ack, body, client, logger):
     ack()
 
-    # ── Collect remaining fields before spawning thread ────────────────────
-    contact_number   = (
-        state_values.get("contact_number", {})
-        .get("value", {}).get("value", "")
-    )
-    captured_date_str = (
-        state_values.get("captured_date", {})
-        .get("value", {}).get("selected_date", "")
-    )
-    payment_type = (
-        state_values.get("payment_type", {})
-        .get("value", {}).get("selected_option", {}).get("value", "")
-    )
-    property_name = (
-        state_values.get("for_property", {})
-        .get("value", {}).get("selected_option", {}).get("value", "")
-    )
-
-    # ── Background thread: DB insert → Slack prompt ───────────────────────
-    def _save_pending_income():
-        # Generate unique transaction_id
-        transaction_id = f"TXN-{uuid.uuid4().hex[:8]}"
-
-        # Parse dates
-        captured_dt = datetime.now().date()
-        if captured_date_str:
-            try:
-                captured_dt = datetime.strptime(captured_date_str, "%Y-%m-%d").date()
-            except Exception:
-                pass
-
-        receipt_dt = None
-        if receipt_date:
-            try:
-                receipt_dt = datetime.strptime(receipt_date, "%Y-%m-%d").date()
-            except Exception:
-                pass
-
-        db = SessionLocal()
+    def _process_income():
+        logger.info("THREAD STARTED")
         try:
-            # ── INSERT PENDING record — screenshot = NULL ──────────────────
-            new_income = Income(
-                transaction_id   = transaction_id,
-                user_id          = user_id,
-                status           = "PENDING",
-                name             = name,
-                booking_number   = booking_number,
-                contact_number   = contact_number,
-                captured_date    = captured_dt,
-                room_amount      = float(room_amount_str),
-                food_amount      = float(food_amount_str),
-                receipt_by       = receipt_by,
-                payment_type     = payment_type,
-                for_property     = {"name": property_name},
-                receipt_date     = receipt_dt,
-                payment_screenshot = None,
-                submitted_by     = user_id,
-                submitted_at     = datetime.utcnow(),
+            user_id      = body.get("user", {}).get("id")
+            state_values = body.get("view", {}).get("state", {}).get("values", {})
+            # Extract
+            name            = state_values["name_block"]["name"]["value"]
+            booking_number  = state_values["booking_block"]["booking"]["value"]
+            room_amount_str = state_values["room_block"]["room"]["value"]
+            food_amount_str = state_values["food_block"]["food"]["value"]
+            receipt_by      = state_values["receipt_block"]["receipt"]["value"]
+            receipt_date    = (
+                state_values
+                .get("receipt_date", {})
+                .get("receipt_date_input", {})
+                .get("selected_date")
             )
-            db.add(new_income)
-            db.commit()
-            logger.info(
-                f"PENDING income created | txn={transaction_id} | "
-                f"user={user_id} | property={property_name}"
+            contact_number = (
+                state_values.get("contact_number", {})
+                .get("value", {}).get("value", "")
             )
-
-            # ── Prompt user to upload screenshot ──────────────────────────
-            client.chat_postMessage(
-                channel=user_id,
-                text=(
-                    f"✅ Income form received (Transaction ID: `{transaction_id}`)\n"
-                    "📎 Please upload the *payment screenshot* to complete your submission."
-                )
+            captured_date_str = (
+                state_values.get("captured_date", {})
+                .get("value", {}).get("selected_date", "")
+            )
+            payment_type = (
+                state_values.get("payment_type", {})
+                .get("value", {}).get("selected_option", {}).get("value", "")
+            )
+            property_name = (
+                state_values.get("for_property", {})
+                .get("value", {}).get("selected_option", {}).get("value", "")
             )
 
-        except Exception as e:
-            db.rollback()
-            logger.error(f"DB error creating PENDING income: {e}")
-            try:
+            # Validate
+            alpha_regex = re.compile(r"^[A-Za-z\s]+$")
+            errs = []
+            if not name or not alpha_regex.match(name):
+                errs.append("Customer Name: only alphabets allowed.")
+            if not booking_number or not booking_number.isdigit():
+                errs.append("Booking Number: only numbers allowed.")
+            if not room_amount_str or not room_amount_str.isdigit() or int(room_amount_str) <= 0:
+                errs.append("Room Amount: must be a positive number.")
+            if not food_amount_str or not food_amount_str.isdigit() or int(food_amount_str) < 0:
+                errs.append("Food Amount: must be a non-negative number.")
+            if not receipt_by or not alpha_regex.match(receipt_by):
+                errs.append("Receipt By: only alphabets allowed.")
+            if errs:
                 client.chat_postMessage(
                     channel=user_id,
-                    text=f"❌ Database error while saving your submission: {str(e)}"
+                    text="\u274c Income submission failed:\n" + "\n".join(f"\u2022 {e}" for e in errs)
                 )
+                return
+
+            # Generate transaction_id
+            transaction_id = f"TXN-{uuid.uuid4().hex[:8]}"
+
+            # Parse dates
+            captured_dt = datetime.now().date()
+            if captured_date_str:
+                try:
+                    captured_dt = datetime.strptime(captured_date_str, "%Y-%m-%d").date()
+                except Exception:
+                    pass
+
+            receipt_dt = None
+            if receipt_date:
+                try:
+                    receipt_dt = datetime.strptime(receipt_date, "%Y-%m-%d").date()
+                except Exception:
+                    pass
+
+            db = SessionLocal()
+            try:
+                new_income = Income(
+                    transaction_id     = transaction_id,
+                    user_id            = user_id,
+                    status             = "PENDING",
+                    name               = name,
+                    booking_number     = booking_number,
+                    contact_number     = contact_number,
+                    captured_date      = captured_dt,
+                    room_amount        = float(room_amount_str),
+                    food_amount        = float(food_amount_str),
+                    receipt_by         = receipt_by,
+                    payment_type       = payment_type,
+                    for_property       = {"name": property_name},
+                    receipt_date       = receipt_dt,
+                    payment_screenshot = None,
+                    submitted_by       = user_id,
+                    submitted_at       = datetime.utcnow(),
+                )
+                db.add(new_income)
+                db.commit()
+                logger.info(
+                    f"PENDING income created | txn={transaction_id} | "
+                    f"user={user_id} | property={property_name}"
+                )
+                client.chat_postMessage(
+                    channel=user_id,
+                    text=(
+                        f"\u2705 Income form received (Transaction ID: `{transaction_id}`)\n"
+                        "\U0001f4ce Please upload the *payment screenshot* to complete the submission."
+                    )
+                )
+            except Exception as e:
+                db.rollback()
+                logger.error(f"DB error creating PENDING income: {e}")
+                try:
+                    client.chat_postMessage(
+                        channel=user_id,
+                        text=f"\u274c Database error while saving your submission: {str(e)}"
+                    )
+                except Exception:
+                    pass
+            finally:
+                db.close()
+
+            logger.info("THREAD COMPLETED")  # trace
+
+        except Exception as e:
+            logger.error(f"Thread crash: {str(e)}")
+            try:
+                user_id = body.get("user", {}).get("id")
+                if user_id:
+                    client.chat_postMessage(
+                        channel=user_id,
+                        text=f"\u274c An error occurred while processing your income form: {str(e)}"
+                    )
             except Exception:
                 pass
-        finally:
-            db.close()
 
-    threading.Thread(target=_save_pending_income, daemon=True).start()
+    threading.Thread(target=_process_income, daemon=True).start()
 
 
 
@@ -768,6 +787,7 @@ def handle_income_modal(ack, body, client):
 # ==============================
 @app.post("/slack/events", summary="Slack Events webhook endpoint")
 async def slack_events(request: Request):
+    logger.info("SLACK EVENT HIT")
     return await handler.handle(request)
 
 

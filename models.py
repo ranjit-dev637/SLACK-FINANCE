@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, Date, JSON, LargeBinary
+from sqlalchemy import Column, Integer, String, Float, DateTime, Date, JSON
 from database import Base
 
 
@@ -27,8 +27,8 @@ class ExpenseDB(Base):
     submitted_by = Column(String)
     submitted_at = Column(DateTime(timezone=True))
 
-    # 🔹 Receipt (BLOB)
-    receipt_copy = Column(LargeBinary, nullable=True)
+    # 🔹 Receipt URL (Supabase Storage)
+    receipt_copy = Column(String, nullable=True)  # public URL
 
 
 class IncomeDB(Base):
@@ -63,8 +63,8 @@ class IncomeDB(Base):
     submitted_by = Column(String)
     submitted_at = Column(DateTime(timezone=True))
 
-    # 🔹 Screenshot (BLOB)
-    payment_screenshot = Column(LargeBinary, nullable=True)
+    # 🔹 Screenshot URL (Supabase Storage)
+    payment_screenshot = Column(String, nullable=True)  # public URL
 
 
 # Aliases
