@@ -35,6 +35,7 @@ from services.db_service import (
 from services.validation import validate_income_data
 from services.file_handler import process_income_file
 from services.supabase_storage import upload_file_to_storage
+from services.slack_downloader import download_slack_file
 
 # Load Environment Variables
 load_dotenv()
@@ -144,42 +145,16 @@ def handle_message_events(body, logger, client):
             record_type = "expense"
             expense_db.close()
 
-        # ── Step 3: Download file from Slack (binary, streamed) ────────
-        slack_token = os.getenv("SLACK_BOT_TOKEN")
-        # Prefer url_private_download (direct binary); fall back to url_private
-        download_url = file.get("url_private_download") or file.get("url_private")
-        logger.info(f"Downloading Slack file | url={download_url}")
+        # ── Step 3: Download file from Slack ─────────────────────────────
+        # download_slack_file() handles: auth header, retries, HTML-response
+        # detection, integrity check, and descriptive RuntimeError messages.
         try:
-            response = requests.get(
-                download_url,
-                headers={"Authorization": f"Bearer {slack_token}"},
-                stream=True,   # ensures raw binary transfer, no auto-decoding
-                timeout=15,
-            )
-            if response.status_code != 200:
-                raise Exception(f"Slack download failed: {response.status_code}")
-
-            content_type = response.headers.get("Content-Type", "")
-            if "text/html" in content_type:
-                raise Exception(
-                    "Slack returned HTML instead of file (invalid auth or URL)"
-                )
-
-            file_bytes = response.content  # raw bytes — never decoded, never stringified
-        except Exception as e:
-            logger.error(f"Failed to download file from Slack: {e}")
+            file_bytes = download_slack_file(file)
+        except RuntimeError as e:
+            logger.error(f"Slack file download failed | txn={transaction_id}: {e}")
             client.chat_postMessage(
                 channel=user_id,
-                text="❌ Failed to download the file from Slack. Please try again."
-            )
-            return
-
-        # ── Integrity check: reject empty / truncated downloads ─────────
-        if not file_bytes or len(file_bytes) < 100:
-            logger.error(f"Downloaded file is empty or corrupted | url={download_url}")
-            client.chat_postMessage(
-                channel=user_id,
-                text="❌ File download was empty or corrupted. Please try uploading again."
+                text=f"❌ Failed to download the file from Slack.\n`{e}`"
             )
             return
 
@@ -1020,7 +995,7 @@ def create_transaction_endpoint(txn: TransactionCreate, db: Session = Depends(ge
 # ==============================
 # UPLOAD TRANSACTION SCREENSHOT
 # ==============================
-from supabase import create_client, Client
+from supabase import create_client, Client  # kept for type hints; client is managed in supabase_storage
 
 @app.post("/upload-screenshot", summary="Upload screenshot and link to transaction")
 async def upload_transaction_screenshot(
@@ -1032,26 +1007,17 @@ async def upload_transaction_screenshot(
     if not txn:
         raise HTTPException(status_code=404, detail="Transaction not found")
 
-    supa_url = os.getenv("SUPABASE_URL")
-    supa_key = os.getenv("SUPABASE_KEY")
-    if not supa_url or not supa_key:
-        raise HTTPException(status_code=500, detail="Supabase Storage credentials not configured")
-
     try:
-        supabase: Client = create_client(supa_url, supa_key)
         file_bytes = await file.read()
-        
-        file_extension = file.filename.split(".")[-1] if "." in file.filename else "png"
-        file_name = f"{transaction_id}.{file_extension}"
-        
-        supabase.storage.from_("screenshots").upload(
-            path=file_name,
-            file=file_bytes,
-            file_options={"content-type": file.content_type}
+        mime_type = file.content_type or "image/jpeg"
+
+        # Reuse the shared Supabase client from supabase_storage (uses SUPABASE_SERVICE_ROLE_KEY)
+        public_url = upload_file_to_storage(
+            transaction_id=transaction_id,
+            file_bytes=file_bytes,
+            mime_type=mime_type,
         )
-        
-        public_url = supabase.storage.from_("screenshots").get_public_url(file_name)
-        
+
         txn.screenshot_url = public_url
         db.commit()
 

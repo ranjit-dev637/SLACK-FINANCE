@@ -1,17 +1,27 @@
 import os
 import logging
+from dotenv import load_dotenv
 from supabase import create_client, Client
 
 logger = logging.getLogger(__name__)
 
-# ── Supabase client (initialised once at import time) ─────────────────────────
-_supabase: Client = create_client(
-    os.getenv("SUPABASE_URL", ""),
-    os.getenv("SUPABASE_KEY", ""),
-)
+# Load .env before reading any variable (safe to call multiple times)
+load_dotenv()
+
+# ── Validate required env vars at startup ─────────────────────────────────────
+_SUPABASE_URL = os.getenv("SUPABASE_URL")
+_SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # service-role key for backend ops
+
+if not _SUPABASE_URL:
+    raise ValueError("SUPABASE_URL environment variable is not set or empty.")
+if not _SUPABASE_KEY:
+    raise ValueError("SUPABASE_SERVICE_ROLE_KEY environment variable is not set or empty.")
+
+# ── Supabase client (initialised once, reused across all requests) ────────────
+_supabase: Client = create_client(_SUPABASE_URL, _SUPABASE_KEY)
 
 BUCKET = "receipts"
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_URL = _SUPABASE_URL
 
 
 def upload_file_to_storage(
