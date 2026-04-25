@@ -28,6 +28,7 @@ def upload_file_to_storage(
     transaction_id: str,
     file_bytes: bytes,
     mime_type: str = "image/jpeg",
+    file_index: int = 1,
 ) -> str:
     """
     Uploads file_bytes to Supabase Storage under the "receipts" bucket.
@@ -48,7 +49,7 @@ def upload_file_to_storage(
         "application/pdf": "pdf",
     }
     ext = ext_map.get(mime_type, "jpg")
-    file_path = f"{transaction_id}.{ext}"
+    file_path = f"{transaction_id}_{file_index}.{ext}"
 
     logger.info(f"Uploading to Supabase Storage | bucket={BUCKET} | path={file_path}")
 

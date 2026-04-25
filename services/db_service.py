@@ -3,6 +3,7 @@ import logging
 from datetime import datetime
 from database import SessionLocal
 from models import Income, Expense
+from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +130,7 @@ def get_pending_income(user_id: str):
     try:
         record = (
             db.query(Income)
-            .filter(Income.user_id == user_id, Income.status == "PENDING")
+            .filter(Income.user_id == user_id, Income.status.in_(["PENDING", "UPLOADING"]))
             .order_by(Income.submitted_at.desc())
             .first()
         )
@@ -257,7 +258,7 @@ def get_pending_expense(user_id: str):
     try:
         record = (
             db.query(Expense)
-            .filter(Expense.user_id == user_id, Expense.status == "PENDING")
+            .filter(Expense.user_id == user_id, Expense.status.in_(["PENDING", "UPLOADING"]))
             .order_by(Expense.submitted_at.desc())
             .first()
         )
@@ -314,5 +315,117 @@ def complete_expense_with_receipt(transaction_id: str, file_url: str) -> bool:
         db.rollback()
         logger.error(f"DB error completing expense txn={transaction_id}: {e}")
         raise
+    finally:
+        db.close()
+def append_income_file(transaction_id: str, file_url: str) -> int:
+    """
+    Atomically appends file_url to payment_screenshots JSONB array and sets
+    status = 'UPLOADING' in a single SQL UPDATE — no read-modify-write race.
+
+    Uses PostgreSQL's || operator:  coalesce(column, '[]'::jsonb) || jsonb_build_array(:url)
+    Returns the new total file count.
+    """
+    db = SessionLocal()
+    try:
+        result = db.execute(
+            text("""
+                UPDATE incomes
+                SET
+                    payment_screenshots = COALESCE(payment_screenshots, '[]'::jsonb)
+                                         || jsonb_build_array(:url),
+                    status = 'UPLOADING'
+                WHERE transaction_id = :txn_id
+                RETURNING jsonb_array_length(
+                    COALESCE(payment_screenshots, '[]'::jsonb) || jsonb_build_array(:url)
+                ) AS new_count
+            """),
+            {"url": file_url, "txn_id": transaction_id},
+        )
+        row = result.fetchone()
+        if row is None:
+            raise ValueError(f"Income not found: {transaction_id}")
+        db.commit()
+        logger.info(f"Income file appended (atomic) | txn={transaction_id} | count={row.new_count}")
+        return row.new_count
+    except Exception as e:
+        db.rollback()
+        logger.error(f"DB error appending income file | txn={transaction_id}: {e}")
+        raise
+    finally:
+        db.close()
+
+
+def complete_income_multi(transaction_id: str) -> list:
+    db = SessionLocal()
+    try:
+        record = db.query(Income).filter(
+            Income.transaction_id == transaction_id
+        ).first()
+        if not record:
+            raise ValueError(f"Income not found: {transaction_id}")
+        urls = record.payment_screenshots or []
+        record.status = "COMPLETED"
+        record.file_uploaded = True
+        if urls:
+            record.payment_screenshot = urls[0]
+        db.commit()
+        return urls
+    finally:
+        db.close()
+
+
+def append_expense_file(transaction_id: str, file_url: str) -> int:
+    """
+    Atomically appends file_url to receipt_copies JSONB array and sets
+    status = 'UPLOADING' in a single SQL UPDATE — no read-modify-write race.
+
+    Uses PostgreSQL's || operator:  coalesce(column, '[]'::jsonb) || jsonb_build_array(:url)
+    Returns the new total file count.
+    """
+    db = SessionLocal()
+    try:
+        result = db.execute(
+            text("""
+                UPDATE expenses
+                SET
+                    receipt_copies = COALESCE(receipt_copies, '[]'::jsonb)
+                                     || jsonb_build_array(:url),
+                    status = 'UPLOADING'
+                WHERE transaction_id = :txn_id
+                RETURNING jsonb_array_length(
+                    COALESCE(receipt_copies, '[]'::jsonb) || jsonb_build_array(:url)
+                ) AS new_count
+            """),
+            {"url": file_url, "txn_id": transaction_id},
+        )
+        row = result.fetchone()
+        if row is None:
+            raise ValueError(f"Expense not found: {transaction_id}")
+        db.commit()
+        logger.info(f"Expense file appended (atomic) | txn={transaction_id} | count={row.new_count}")
+        return row.new_count
+    except Exception as e:
+        db.rollback()
+        logger.error(f"DB error appending expense file | txn={transaction_id}: {e}")
+        raise
+    finally:
+        db.close()
+
+
+def complete_expense_multi(transaction_id: str) -> list:
+    db = SessionLocal()
+    try:
+        record = db.query(Expense).filter(
+            Expense.transaction_id == transaction_id
+        ).first()
+        if not record:
+            raise ValueError(f"Expense not found: {transaction_id}")
+        urls = record.receipt_copies or []
+        record.status = "COMPLETED"
+        record.file_uploaded = True
+        if urls:
+            record.receipt_copy = urls[0]
+        db.commit()
+        return urls
     finally:
         db.close()

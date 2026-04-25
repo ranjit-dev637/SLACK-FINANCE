@@ -1,15 +1,20 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 import os
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-# Load environment variables from .env file BEFORE reading any variable
-load_dotenv()
+# Load environment variables from .env BEFORE reading any variable.
+# - find_dotenv() locates the .env file regardless of the current working directory.
+# - override=True ensures .env values always win over VS Code's environment injection.
+load_dotenv(find_dotenv(), override=True)
 
 # Validate DATABASE_URL is present
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL is not set. Check your .env file.")
+
+# Debug print — confirms the correct URL is in use at startup (truncated for safety)
+print(f"[database.py] DATABASE_URL loaded: {DATABASE_URL[:55]}...")
 
 # Direct Supabase connection (port 5432) — no pooler, no encoding needed
 engine = create_engine(
