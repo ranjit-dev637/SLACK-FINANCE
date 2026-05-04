@@ -1,7 +1,21 @@
 __pycache__/
 *.pyc
 .env
+
+# virtual env
 venv/
 env/
+
+# IDE
 .vscode/
 .DS_Store
+
+# secrets (CRITICAL)
+credentials.json
+service_account.json
+service_account.json.json
+token.pickle
+
+# logs
+*.log
+out.log

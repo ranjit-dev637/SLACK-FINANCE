@@ -2,7 +2,7 @@ from sqlalchemy import Column, Integer, String, Float, DateTime, Date, JSON, Boo
 from database import Base
 
 
-class ExpenseDB(Base):
+class Expense(Base):
     __tablename__ = "expenses"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -24,17 +24,26 @@ class ExpenseDB(Base):
 
     # 🔹 Metadata
     for_property = Column(JSON)
-    submitted_by = Column(String)
+    submitted_by_id = Column(String)
+    submitted_by_name = Column(String)
+    submitted_by = Column(String)  # Deprecated, keep for safety
     submitted_at = Column(DateTime(timezone=True))
 
     # 🔹 Receipt URL (Supabase Storage)
-    receipt_copy = Column(String, nullable=True)  # public URL
+    receipt_copy = Column(String, nullable=True)  # public URL (latest)
 
     receipt_copies = Column(JSON, default=list)
     file_uploaded  = Column(Boolean, default=False)
 
+    # 🔹 Google Drive Links
+    drive_links = Column(JSON, default=list)
 
-class IncomeDB(Base):
+    # 🔹 Pipeline metadata
+    updated_at    = Column(DateTime(timezone=True), nullable=True)
+    error_message = Column(String, nullable=True)
+
+
+class Income(Base):
     __tablename__ = "incomes"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -63,19 +72,26 @@ class IncomeDB(Base):
 
     # 🔹 Metadata
     for_property = Column(JSON)
-    submitted_by = Column(String)
+    submitted_by_id = Column(String)
+    submitted_by_name = Column(String)
+    submitted_by = Column(String)  # Deprecated, keep for safety
     submitted_at = Column(DateTime(timezone=True))
 
     # 🔹 Screenshot URL (Supabase Storage)
-    payment_screenshot = Column(String, nullable=True)  # public URL
+    payment_screenshot = Column(String, nullable=True)  # public URL (latest)
 
     payment_screenshots = Column(JSON, default=list)
     file_uploaded       = Column(Boolean, default=False)
 
+    # 🔹 Google Drive Links
+    drive_links = Column(JSON, default=list)
 
-# Aliases
-Expense = ExpenseDB
-Income = IncomeDB
+    # 🔹 Pipeline metadata
+    updated_at    = Column(DateTime(timezone=True), nullable=True)
+    error_message = Column(String, nullable=True)
+
+
+# Aliases removed
 
 import uuid
 from sqlalchemy.dialects.postgresql import UUID

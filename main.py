@@ -23,6 +23,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from fastapi import FastAPI, Request, UploadFile, File, Depends, HTTPException, Form, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 import requests
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
@@ -43,21 +44,16 @@ from services.db_service import (
     insert_razorpay_income,
     insert_income_form_record,
     get_pending_income,
-    complete_income_with_screenshot,
     insert_expense_record,
     get_pending_expense,
-    complete_expense_with_receipt,
-    append_income_file,
-    append_expense_file,
-    complete_income_multi,
-    complete_expense_multi,
-
-
 )
 from services.validation import validate_income_data
 from services.file_handler import process_income_file
 from services.supabase_storage import upload_file_to_storage
+from services.google_drive import upload_to_drive
 from services.slack_downloader import download_slack_file
+from services.upload_pipeline import process_upload
+from services.circuit_breaker import all_breaker_states
 
 # ==============================
 # FILE VALIDATION CONSTANTS
@@ -77,6 +73,51 @@ else:
     logger.error("SLACK_BOT_TOKEN is NOT set — check your .env file!")
 
 app = FastAPI(title="Finance API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # allow all origins for development
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ==============================
+# HEALTH CHECK
+# ==============================
+@app.get("/health", summary="Service health check", tags=["Ops"])
+def health_check():
+    """
+    Returns the operational health of the service including:
+    - Database connectivity
+    - Circuit breaker states for Drive and Supabase
+    """
+    from datetime import timezone as tz
+
+    # Probe the database with a lightweight query
+    db_status = "ok"
+    try:
+        from database import SessionLocal
+        from sqlalchemy import text as _text
+        _db = SessionLocal()
+        _db.execute(_text("SELECT 1"))
+        _db.close()
+    except Exception as _db_err:
+        db_status = f"degraded: {_db_err}"
+        logger.error("health_check_db_failed | error=%s", _db_err)
+
+    circuits = all_breaker_states()
+    overall  = "ok" if db_status == "ok" else "degraded"
+
+    return {
+        "status":           overall,
+        "service":          "upload_pipeline",
+        "db":               db_status,
+        "drive_circuit":    circuits.get("drive",    "CLOSED"),
+        "supabase_circuit": circuits.get("supabase", "CLOSED"),
+        "timestamp":        datetime.now(tz.utc).isoformat(),
+    }
 
 # ==============================
 # DATABASE DEPENDENCY
@@ -114,150 +155,18 @@ slack_app = SlackApp(
 handler = SlackRequestHandler(slack_app)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MULTI-FILE UPLOAD STATE
-# Thread-safe in-memory counter: key=(user_id, transaction_id) → file count
+# DB HELPERS & BLOCK KIT MESSAGE BUILDERS
 # ══════════════════════════════════════════════════════════════════════════════
-_upload_state: dict = {}
-_upload_state_lock = threading.Lock()
-
-
-def _get_file_count(user_id: str, transaction_id: str) -> int:
-    with _upload_state_lock:
-        return _upload_state.get((user_id, transaction_id), 0)
-
-
-def _set_file_count(user_id: str, transaction_id: str, count: int):
-    with _upload_state_lock:
-        _upload_state[(user_id, transaction_id)] = count
-
-
-def _clear_upload_state(user_id: str, transaction_id: str):
-    with _upload_state_lock:
-        _upload_state.pop((user_id, transaction_id), None)
-
-
-def _build_done_button(transaction_id: str, record_type: str) -> dict:
-    return {
-        "blocks": [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"Upload more files, or tap *Done* when finished."
-                    ),
-                },
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Done", "emoji": True},
-                        "style": "primary",
-                        "value": f"{record_type}|{transaction_id}",
-                        "action_id": "multi_upload_done",
-                    }
-                ],
-            },
-        ]
-    }
-
-
-# ── Duplicate-click guard ──────────────────────────────────────────────────────
-_completed_transactions: set = set()
-_completed_lock = threading.Lock()
-
-# ── Done button action handler ─────────────────────────────────────────────────
-@slack_app.action("multi_upload_done")
-def handle_done_button(ack, body, client, logger):
-    ack()
-
-    def _complete():
-        try:
-            user_id = body.get("user", {}).get("id")
-            value   = body.get("actions", [{}])[0].get("value", "")
-
-            if "|" not in value:
-                logger.error(f"Malformed done-button value: {value}")
-                return
-
-            record_type, transaction_id = value.split("|", 1)
-
-            # Guard: ignore duplicate button clicks for the same transaction
-            with _completed_lock:
-                if transaction_id in _completed_transactions:
-                    logger.info(f"Duplicate Done click ignored | txn={transaction_id}")
-                    return
-                _completed_transactions.add(transaction_id)
-
-            # Complete in DB
-            if record_type == "income":
-                urls   = complete_income_multi(transaction_id)
-                entity = "Income"
-            else:
-                urls   = complete_expense_multi(transaction_id)
-                entity = "Expense"
-
-            _clear_upload_state(user_id, transaction_id)
-
-            # Build rich Block Kit completion message
-            count      = len(urls)
-            file_lines = "\n".join(f"  {i+1}. {url}" for i, url in enumerate(urls))
-
-            client.chat_postMessage(
-                channel=user_id,
-                blocks=[
-                    {
-                        "type": "header",
-                        "text": {
-                            "type": "plain_text",
-                            "text": f"✅ {entity} COMPLETED",
-                            "emoji": True,
-                        },
-                    },
-                    {
-                        "type": "section",
-                        "fields": [
-                            {
-                                "type": "mrkdwn",
-                                "text": f"*Transaction ID:*\n`{transaction_id}`",
-                            },
-                            {
-                                "type": "mrkdwn",
-                                "text": f"*Files Uploaded:*\n{count} file{'s' if count != 1 else ''}",
-                            },
-                        ],
-                    },
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"*📎 File URLs:*\n{file_lines}",
-                        },
-                    },
-                ],
-                text=f"✅ {entity} {transaction_id} COMPLETED — {count} file(s) saved.",
-            )
-
-            logger.info(
-                f"{entity} COMPLETED | txn={transaction_id} | "
-                f"files={count} | user={user_id}"
-            )
-
-        except Exception:
-            logger.exception("handle_done_button crashed")
-            try:
-                user_id = body.get("user", {}).get("id")
-                if user_id:
-                    client.chat_postMessage(
-                        channel=user_id,
-                        text="❌ Something went wrong. Please contact support."
-                    )
-            except Exception:
-                pass
-
-    threading.Thread(target=_complete, daemon=True).start()
+def fetch_transaction_record(transaction_id: str, record_type: str):
+    db = SessionLocal()
+    try:
+        from models import Income, Expense
+        if record_type == "income":
+            return db.query(Income).filter_by(transaction_id=transaction_id).first()
+        else:
+            return db.query(Expense).filter_by(transaction_id=transaction_id).first()
+    finally:
+        db.close()
 
 
 # ── Message event handler ──────────────────────────────────────────────────────
@@ -281,152 +190,13 @@ def handle_message_events(body, logger, client):
     def _process_message():
 
         # ══════════════════════════════════════════════════════════════════
-        # FILE UPLOAD → multi-file: iterate every file in the upload event
+        # FILE UPLOAD (Now Handled by FastAPI Interceptor in /slack/events)
         # ══════════════════════════════════════════════════════════════════
         if subtype == "file_share":
-            if not files:
-                return
-
-            # Check BOTH pending records independently — fetch income and expense in parallel,
-            # then attach the file to whichever was submitted most recently.
-            pending_income = pending_expense = None
-            income_db = expense_db = None
-
-            try:
-                pending_income, income_db = get_pending_income(user_id)
-            except Exception as e:
-                logger.error(f"DB error fetching pending income | user={user_id}: {e}")
-
-            try:
-                pending_expense, expense_db = get_pending_expense(user_id)
-            except Exception as e:
-                logger.error(f"DB error fetching pending expense | user={user_id}: {e}")
-
-            if not pending_income and not pending_expense:
-                if income_db:
-                    income_db.close()
-                if expense_db:
-                    expense_db.close()
-                client.chat_postMessage(
-                    channel=user_id,
-                    text="❌ No pending submission found. Please submit a /income or /expense form first.",
-                )
-                return
-
-            # Pick the MOST RECENT pending record
-            # This ensures income and expense never interfere with each other
-            if pending_income and pending_expense:
-                # Both pending — pick whichever was submitted most recently
-                if pending_income.submitted_at >= pending_expense.submitted_at:
-                    transaction_id = pending_income.transaction_id
-                    record_type    = "income"
-                    income_db.close()
-                    if expense_db:
-                        expense_db.close()
-                else:
-                    transaction_id = pending_expense.transaction_id
-                    record_type    = "expense"
-                    expense_db.close()
-                    if income_db:
-                        income_db.close()
-            elif pending_income:
-                transaction_id = pending_income.transaction_id
-                record_type    = "income"
-                income_db.close()
-                if expense_db:
-                    expense_db.close()
-            else:
-                transaction_id = pending_expense.transaction_id
-                record_type    = "expense"
-                expense_db.close()
-                if income_db:
-                    income_db.close()
-
-            logger.info(f"File will be attached to {record_type} | txn={transaction_id} | user={user_id}")
-
-            # ── Process ALL files in this event against the same transaction ──
-            uploaded_count = 0
-            for file in files:
-                mime_type = file.get("mimetype", "")
-
-                # MIME type validation
-                if mime_type not in ALLOWED_TYPES:
-                    client.chat_postMessage(
-                        channel=user_id,
-                        text=f"❌ File skipped — invalid type: {mime_type}. Only JPG, PNG, PDF allowed."
-                    )
-                    continue
-
-                # Download from Slack
-                try:
-                    file_bytes = download_slack_file(file)
-                except RuntimeError as e:
-                    logger.error(f"Slack download failed | txn={transaction_id}: {e}")
-                    client.chat_postMessage(
-                        channel=user_id,
-                        text="❌ Could not download a file from Slack. Please try again."
-                    )
-                    continue
-
-                # File size validation
-                if len(file_bytes) > MAX_FILE_SIZE:
-                    client.chat_postMessage(
-                        channel=user_id,
-                        text="❌ File too large. Please upload files under 5 MB."
-                    )
-                    continue
-
-                # Upload to Supabase Storage
-                current_count = _get_file_count(user_id, transaction_id)
-                file_index    = current_count + 1
-
-                try:
-                    file_url = upload_file_to_storage(
-                        transaction_id=transaction_id,
-                        file_bytes=file_bytes,
-                        mime_type=mime_type,
-                        file_index=file_index,
-                    )
-                except Exception as e:
-                    logger.error(f"Storage upload failed | txn={transaction_id} | file={file_index}: {e}")
-                    client.chat_postMessage(
-                        channel=user_id,
-                        text="❌ File upload to storage failed. Please try again."
-                    )
-                    continue
-
-                # Append URL to DB (stays UPLOADING until Done button)
-                try:
-                    if record_type == "income":
-                        new_count = append_income_file(transaction_id, file_url)
-                    else:
-                        new_count = append_expense_file(transaction_id, file_url)
-                except Exception as e:
-                    logger.error(f"DB append failed | txn={transaction_id}: {e}")
-                    client.chat_postMessage(
-                        channel=user_id,
-                        text="❌ File saved but database update failed. Please contact support."
-                    )
-                    continue
-
-                _set_file_count(user_id, transaction_id, new_count)
-                uploaded_count += 1
-
-                logger.info(
-                    f"File {new_count} appended | txn={transaction_id} | "
-                    f"type={record_type} | user={user_id}"
-                )
-
-            # ── Send ONE Done button after all files in this event are processed
-            if uploaded_count > 0:
-                total = _get_file_count(user_id, transaction_id)
-                client.chat_postMessage(
-                    channel=user_id,
-                    text=f"📎 {uploaded_count} file{'s' if uploaded_count > 1 else ''} received. Total so far: {total}.",
-                    **_build_done_button(transaction_id, record_type),
-                )
-
-            return  # end of file_share handling
+            # Native file processing is removed from the Bolt handler to 
+            # prevent 3-second timeouts. File parsing is now intercepted 
+            # before it reaches Bolt.
+            return
 
         # ══════════════════════════════════════════════════════════════════
         # AUTO RAZORPAY DETECTION
@@ -520,233 +290,225 @@ def open_expense(ack, body, client, logger):
     ack()
 
     # STEP 2: Open the modal in a background thread so the handler returns instantly
-    def _open_expense_modal():
+    try:
+        client.views_open(
+            trigger_id=body["trigger_id"],
+            view={
+                "type": "modal",
+                "callback_id": "expense_modal",
+                "title": {"type": "plain_text", "text": "Submit Expense"},
+                "submit": {"type": "plain_text", "text": "Submit"},
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "expense_name_block",
+                        "element": {"type": "plain_text_input", "action_id": "expense_name"},
+                        "label": {"type": "plain_text", "text": "Expense Name"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "seller_name_block",
+                        "element": {"type": "plain_text_input", "action_id": "seller_name"},
+                        "label": {"type": "plain_text", "text": "Seller Name"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "gst_amount_block",
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "gst_amount",
+                            "initial_value": "0",
+                            "placeholder": {"type": "plain_text", "text": "e.g. 150"}
+                        },
+                        "label": {"type": "plain_text", "text": "GST Amount"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "total_amount_block",
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "total_amount",
+                            "placeholder": {"type": "plain_text", "text": "e.g. 1500"}
+                        },
+                        "label": {"type": "plain_text", "text": "Total Amount"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "purchase_date_block",
+                        "element": {
+                            "type": "datepicker",
+                            "action_id": "purchase_date_input",
+                            "placeholder": {"type": "plain_text", "text": "Select purchase date"}
+                        },
+                        "label": {"type": "plain_text", "text": "Purchase Date"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "priority_block",
+                        "element": {
+                            "type": "static_select",
+                            "action_id": "priority",
+                            "placeholder": {"type": "plain_text", "text": "Select priority"},
+                            "options": [
+                                {"text": {"type": "plain_text", "text": "Critical \u26a0\ufe0f"}, "value": "Critical"},
+                                {"text": {"type": "plain_text", "text": "High"},            "value": "High"},
+                                {"text": {"type": "plain_text", "text": "Medium"},          "value": "Medium"},
+                                {"text": {"type": "plain_text", "text": "Low"},             "value": "Low"}
+                            ]
+                        },
+                        "label": {"type": "plain_text", "text": "Priority"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "paid_by_block",
+                        "element": {"type": "plain_text_input", "action_id": "paid_by"},
+                        "label": {"type": "plain_text", "text": "Paid By"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "mode_of_payment_block",
+                        "element": {
+                            "type": "static_select",
+                            "action_id": "mode_of_payment",
+                            "placeholder": {"type": "plain_text", "text": "Select payment mode"},
+                            "options": [
+                                {"text": {"type": "plain_text", "text": "Cash"},        "value": "Cash"},
+                                {"text": {"type": "plain_text", "text": "Bank"},        "value": "Bank"},
+                                {"text": {"type": "plain_text", "text": "UPI"},         "value": "UPI"},
+                                {"text": {"type": "plain_text", "text": "Credit Card"}, "value": "Credit Card"},
+                                {"text": {"type": "plain_text", "text": "Petty Cash"},  "value": "Petty Cash"},
+                                {"text": {"type": "plain_text", "text": "Company"},     "value": "Company"}
+                            ]
+                        },
+                        "label": {"type": "plain_text", "text": "Mode Of Payment"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "property_block",
+                        "element": {
+                            "type": "radio_buttons",
+                            "action_id": "property",
+                            "options": PROPERTIES
+                        },
+                        "label": {"type": "plain_text", "text": "Property"}
+                    }
+                ]
+            }
+        )
+    except Exception as e:
+        logger.error(f"Failed to open /expense modal: {str(e)}")
         try:
-            client.views_open(
-                trigger_id=body["trigger_id"],
-                view={
-                    "type": "modal",
-                    "callback_id": "expense_modal",
-                    "title": {"type": "plain_text", "text": "Submit Expense"},
-                    "submit": {"type": "plain_text", "text": "Submit"},
-                    "blocks": [
-                        {
-                            "type": "input",
-                            "block_id": "expense_name_block",
-                            "element": {"type": "plain_text_input", "action_id": "expense_name"},
-                            "label": {"type": "plain_text", "text": "Expense Name"}
-                        },
-                        {
-                            "type": "input",
-                            "block_id": "seller_name_block",
-                            "element": {"type": "plain_text_input", "action_id": "seller_name"},
-                            "label": {"type": "plain_text", "text": "Seller Name"}
-                        },
-                        {
-                            "type": "input",
-                            "block_id": "gst_amount_block",
-                            "element": {
-                                "type": "plain_text_input",
-                                "action_id": "gst_amount",
-                                "initial_value": "0",
-                                "placeholder": {"type": "plain_text", "text": "e.g. 150"}
-                            },
-                            "label": {"type": "plain_text", "text": "GST Amount"}
-                        },
-                        {
-                            "type": "input",
-                            "block_id": "total_amount_block",
-                            "element": {
-                                "type": "plain_text_input",
-                                "action_id": "total_amount",
-                                "placeholder": {"type": "plain_text", "text": "e.g. 1500"}
-                            },
-                            "label": {"type": "plain_text", "text": "Total Amount"}
-                        },
-                        {
-                            "type": "input",
-                            "block_id": "purchase_date_block",
-                            "element": {
-                                "type": "datepicker",
-                                "action_id": "purchase_date_input",
-                                "placeholder": {"type": "plain_text", "text": "Select purchase date"}
-                            },
-                            "label": {"type": "plain_text", "text": "Purchase Date"}
-                        },
-                        {
-                            "type": "input",
-                            "block_id": "priority_block",
-                            "element": {
-                                "type": "static_select",
-                                "action_id": "priority",
-                                "placeholder": {"type": "plain_text", "text": "Select priority"},
-                                "options": [
-                                    {"text": {"type": "plain_text", "text": "Critical \u26a0\ufe0f"}, "value": "Critical"},
-                                    {"text": {"type": "plain_text", "text": "High"},            "value": "High"},
-                                    {"text": {"type": "plain_text", "text": "Medium"},          "value": "Medium"},
-                                    {"text": {"type": "plain_text", "text": "Low"},             "value": "Low"}
-                                ]
-                            },
-                            "label": {"type": "plain_text", "text": "Priority"}
-                        },
-                        {
-                            "type": "input",
-                            "block_id": "paid_by_block",
-                            "element": {"type": "plain_text_input", "action_id": "paid_by"},
-                            "label": {"type": "plain_text", "text": "Paid By"}
-                        },
-                        {
-                            "type": "input",
-                            "block_id": "mode_of_payment_block",
-                            "element": {
-                                "type": "static_select",
-                                "action_id": "mode_of_payment",
-                                "placeholder": {"type": "plain_text", "text": "Select payment mode"},
-                                "options": [
-                                    {"text": {"type": "plain_text", "text": "Cash"},        "value": "Cash"},
-                                    {"text": {"type": "plain_text", "text": "Bank"},        "value": "Bank"},
-                                    {"text": {"type": "plain_text", "text": "UPI"},         "value": "UPI"},
-                                    {"text": {"type": "plain_text", "text": "Credit Card"}, "value": "Credit Card"},
-                                    {"text": {"type": "plain_text", "text": "Petty Cash"},  "value": "Petty Cash"},
-                                    {"text": {"type": "plain_text", "text": "Company"},     "value": "Company"}
-                                ]
-                            },
-                            "label": {"type": "plain_text", "text": "Mode Of Payment"}
-                        },
-                        {
-                            "type": "input",
-                            "block_id": "property_block",
-                            "element": {
-                                "type": "radio_buttons",
-                                "action_id": "property",
-                                "options": PROPERTIES
-                            },
-                            "label": {"type": "plain_text", "text": "Property"}
-                        }
-                    ]
-                }
-            )
-        except Exception as e:
-            logger.error(f"Failed to open /expense modal: {str(e)}")
-            try:
-                user_id = body.get("user_id")
-                if user_id:
-                    client.chat_postMessage(
-                        channel=user_id,
-                        text="\u274c Could not open the expense form. Please try again."
-                    )
-            except Exception:
-                pass
-
-    threading.Thread(target=_open_expense_modal, daemon=True).start()
+            user_id = body.get("user_id")
+            if user_id:
+                client.chat_postMessage(
+                    channel=user_id,
+                    text="\u274c Could not open the expense form. Please try again."
+                )
+        except Exception:
+            pass
 
 
 # ==============================
 # SLACK COMMAND: /income
 # ==============================
 @slack_app.command("/income")
-def open_income(ack, body, client, logger):
-    # STEP 1: Acknowledge immediately — must happen within 3 seconds
+def handle_income(ack, body, client, logger):
+    # STEP 1: ACK IMMEDIATELY (MANDATORY)
     ack()
 
-    # STEP 2: Open the modal in a background thread so the handler returns instantly
-    def _open_income_modal():
-        try:
-            client.views_open(
-                trigger_id=body["trigger_id"],
-                view={
-                    "type": "modal",
-                    "callback_id": "income_modal",
-                    "title": {"type": "plain_text", "text": "Submit Income"},
-                    "submit": {"type": "plain_text", "text": "Submit"},
-                    "blocks": [
-                        {
-                            "type": "input",
-                            "block_id": "for_property",
-                            "element": {
-                                "type": "radio_buttons",
-                                "action_id": "value",
-                                "options": PROPERTIES
-                            },
-                            "label": {"type": "plain_text", "text": "Select Property"}
-                        },
-                        {
-                            "type": "input",
-                            "block_id": "name_block",
-                            "element": {"type": "plain_text_input", "action_id": "name"},
-                            "label": {"type": "plain_text", "text": "Customer Name"}
-                        },
-                        {
-                            "type": "input",
-                            "block_id": "booking_block",
-                            "element": {"type": "plain_text_input", "action_id": "booking"},
-                            "label": {"type": "plain_text", "text": "Booking Number"}
-                        },
-                        {
-                            "type": "input",
-                            "block_id": "payment_type",
-                            "element": {
-                                "type": "static_select",
-                                "action_id": "value",
-                                "placeholder": {"type": "plain_text", "text": "Select payment method"},
-                                "options": [
-                                    {"text": {"type": "plain_text", "text": "Cash"}, "value": "Cash"},
-                                    {"text": {"type": "plain_text", "text": "Bank Transfer"}, "value": "Bank Transfer"},
-                                    {"text": {"type": "plain_text", "text": "UPI"}, "value": "UPI"},
-                                    {"text": {"type": "plain_text", "text": "Credit Card"}, "value": "Credit Card"},
-                                    {"text": {"type": "plain_text", "text": "ICICI Bank POS"}, "value": "ICICI Bank POS"},
-                                    {"text": {"type": "plain_text", "text": "HDFC Bank POS"}, "value": "HDFC Bank POS"},
-                                    {"text": {"type": "plain_text", "text": "QR Code Standy (ICICI)"}, "value": "QR Code Standy (ICICI)"}
-                                ]
-                            },
-                            "label": {"type": "plain_text", "text": "Payment Type"}
-                        },
-                        {
-                            "type": "input",
-                            "block_id": "room_block",
-                            "element": {"type": "plain_text_input", "action_id": "room"},
-                            "label": {"type": "plain_text", "text": "Room Amount"}
-                        },
-                        {
-                            "type": "input",
-                            "block_id": "food_block",
-                            "element": {"type": "plain_text_input", "action_id": "food", "initial_value": "0"},
-                            "label": {"type": "plain_text", "text": "Food Amount"}
-                        },
-                        {
-                            "type": "input",
-                            "block_id": "receipt_block",
-                            "element": {"type": "plain_text_input", "action_id": "receipt"},
-                            "label": {"type": "plain_text", "text": "Receipt By"}
-                        },
-                        {
-                            "type": "input",
-                            "block_id": "receipt_date",
-                            "optional": True,
-                            "element": {
-                                "type": "datepicker",
-                                "action_id": "receipt_date_input",
-                                "placeholder": {"type": "plain_text", "text": "Select receipt date"}
-                            },
-                            "label": {"type": "plain_text", "text": "Receipt Date"}
-                        }
-                    ]
-                }
-            )
-        except Exception as e:
-            logger.error(f"Failed to open /income modal: {str(e)}")
-            try:
-                user_id = body.get("user_id")
-                if user_id:
-                    client.chat_postMessage(
-                        channel=user_id,
-                        text="\u274c Could not open the income form. Please try again."
-                    )
-            except Exception:
-                pass
+    # STEP 2: GET TRIGGER ID
+    print("SLACK BODY:", body)
+    trigger_id = body.get("trigger_id")
 
-    threading.Thread(target=_open_income_modal, daemon=True).start()
+    if not trigger_id:
+        logger.error("No trigger_id found in the request body.")
+        return
 
+    # STEP 3: OPEN MODAL (WITHIN 3 SECONDS)
+    try:
+        client.views_open(
+            trigger_id=trigger_id,
+            view={
+                "type": "modal",
+                "callback_id": "income_modal",
+                "title": {"type": "plain_text", "text": "Submit Income"},
+                "submit": {"type": "plain_text", "text": "Submit"},
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "for_property",
+                        "element": {
+                            "type": "radio_buttons",
+                            "action_id": "value",
+                            "options": PROPERTIES
+                        },
+                        "label": {"type": "plain_text", "text": "Select Property"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "name_block",
+                        "element": {"type": "plain_text_input", "action_id": "name"},
+                        "label": {"type": "plain_text", "text": "Customer Name"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "booking_block",
+                        "element": {"type": "plain_text_input", "action_id": "booking"},
+                        "label": {"type": "plain_text", "text": "Booking Number"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "payment_type",
+                        "element": {
+                            "type": "static_select",
+                            "action_id": "value",
+                            "placeholder": {"type": "plain_text", "text": "Select payment method"},
+                            "options": [
+                                {"text": {"type": "plain_text", "text": "Cash"}, "value": "Cash"},
+                                {"text": {"type": "plain_text", "text": "Bank Transfer"}, "value": "Bank Transfer"},
+                                {"text": {"type": "plain_text", "text": "UPI"}, "value": "UPI"},
+                                {"text": {"type": "plain_text", "text": "Credit Card"}, "value": "Credit Card"},
+                                {"text": {"type": "plain_text", "text": "ICICI Bank POS"}, "value": "ICICI Bank POS"},
+                                {"text": {"type": "plain_text", "text": "HDFC Bank POS"}, "value": "HDFC Bank POS"},
+                                {"text": {"type": "plain_text", "text": "QR Code Standy (ICICI)"}, "value": "QR Code Standy (ICICI)"}
+                            ]
+                        },
+                        "label": {"type": "plain_text", "text": "Payment Type"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "room_block",
+                        "element": {"type": "plain_text_input", "action_id": "room"},
+                        "label": {"type": "plain_text", "text": "Room Amount"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "food_block",
+                        "element": {"type": "plain_text_input", "action_id": "food", "initial_value": "0"},
+                        "label": {"type": "plain_text", "text": "Food Amount"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "receipt_block",
+                        "element": {"type": "plain_text_input", "action_id": "receipt"},
+                        "label": {"type": "plain_text", "text": "Receipt By"}
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "receipt_date",
+                        "optional": True,
+                        "element": {
+                            "type": "datepicker",
+                            "action_id": "receipt_date_input",
+                            "placeholder": {"type": "plain_text", "text": "Select receipt date"}
+                        },
+                        "label": {"type": "plain_text", "text": "Receipt Date"}
+                    }
+                ]
+            }
+        )
+    except Exception as e:
+        logger.error(f"Modal error: {str(e)}")
 
 # ==============================
 # SUBMIT HANDLER: EXPENSE
@@ -945,25 +707,32 @@ def handle_income_modal(ack, body, client, logger):
                     f"PENDING income created | txn={transaction_id} | "
                     f"user={user_id} | property={property_name}"
                 )
-                client.chat_postMessage(
-                    channel=user_id,
-                    text=(
-                        f"\u2705 Income form received (Transaction ID: `{transaction_id}`)\n"
-                        "\U0001f4ce Please upload the *payment screenshot* to complete the submission."
-                    )
-                )
             except Exception as e:
                 db.rollback()
                 logger.error(f"DB error creating PENDING income: {e}")
                 try:
                     client.chat_postMessage(
                         channel=user_id,
-                        text=f"\u274c Database error while saving your submission: {str(e)}"
+                        text=f"❌ Database error while saving your submission: {str(e)}"
                     )
                 except Exception:
                     pass
+                return
             finally:
                 db.close()
+
+            # Send the confirmation message to the user
+            try:
+                client.chat_postMessage(
+                    channel=user_id,
+                    text=(
+                        f"✅ Income form received (Transaction ID: `{transaction_id}`)\n"
+                        "📎 Please upload the payment screenshot to complete the submission."
+                    )
+                )
+                logger.info(f"Confirmation message sent to {user_id}")
+            except Exception as e:
+                logger.error(f"Failed to send confirmation message to {user_id}: {e}")
 
             logger.info("THREAD COMPLETED")  # trace
 
@@ -983,12 +752,219 @@ def handle_income_modal(ack, body, client, logger):
 
 
 
+import collections
+import time
+import json
+
+# Thread-safe bounded cache for deduplicating Slack events
+PROCESSED_EVENTS = collections.OrderedDict()
+MAX_CACHE_SIZE = 1000
+
+def is_event_processed(event_id: str) -> bool:
+    if not event_id:
+        return False
+    if event_id in PROCESSED_EVENTS:
+        return True
+    PROCESSED_EVENTS[event_id] = time.time()
+    if len(PROCESSED_EVENTS) > MAX_CACHE_SIZE:
+        PROCESSED_EVENTS.popitem(last=False)
+    return False
+
+def extract_txn_from_message(text: str) -> str | None:
+    if not text:
+        return None
+    match = re.search(r'\b(EXP-|INC-|TXN-)[A-Za-z0-9\-]+\b', text)
+    return match.group(0) if match else None
+
+def _build_done_button(record_type: str, transaction_id: str):
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"✅ File successfully processed for *{transaction_id}*.\nClick *Done* when you have finished uploading all files for this transaction."
+            }
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Done",
+                        "emoji": True
+                    },
+                    "style": "primary",
+                    "action_id": "multi_upload_done",
+                    "value": f"{record_type}|{transaction_id}"
+                }
+            ]
+        }
+    ]
+
+@slack_app.action("multi_upload_done")
+def handle_multi_upload_done(ack, body, client, logger):
+    ack()
+    try:
+        user_id = body.get("user", {}).get("id")
+        action = body.get("actions", [])[0]
+        value = action.get("value", "")
+        
+        if "|" not in value:
+            return
+            
+        record_type, transaction_id = value.split("|", 1)
+        
+        db = SessionLocal()
+        try:
+            from models import Income, Expense
+            ModelClass = Expense if record_type == "expense" else Income
+            record = db.query(ModelClass).filter(ModelClass.transaction_id == transaction_id).first()
+            if record:
+                record.status = "COMPLETED"
+                db.commit()
+                
+                if body.get("message"):
+                    client.chat_update(
+                        channel=body["channel"]["id"],
+                        ts=body["message"]["ts"],
+                        blocks=[
+                            {
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": f"✅ Transaction *{transaction_id}* marked as COMPLETED."
+                                }
+                            }
+                        ],
+                        text="Transaction completed."
+                    )
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"Error handling multi_upload_done: {e}")
+
+def process_from_slack_file(transaction_id: str, file_url: str, user_id: str):
+    logger.info(f"PIPELINE STARTED | txn={transaction_id}")
+    try:
+        # 1. Fetch file bytes from Slack
+        headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+        response = requests.get(file_url, headers=headers)
+        if response.status_code != 200:
+            raise RuntimeError("Slack file download failed")
+        
+        file_bytes = response.content
+        mime_type = response.headers.get("Content-Type", "image/jpeg")
+        logger.info(f"FILE DOWNLOADED | txn={transaction_id} | size={len(file_bytes)}")
+
+        if len(file_bytes) < 1000:
+            raise RuntimeError("Invalid file: too small")
+
+        if not file_bytes.startswith(b'\xff\xd8'):
+            raise RuntimeError("Invalid image format (not JPEG)")
+
+        if file_bytes.startswith(b'<'):
+            raise RuntimeError("Slack download returned HTML instead of file")
+
+        print("VALID FILE:", len(file_bytes))
+
+        # 2. Get DB record to satisfy process_upload requirements
+        record_type = "expense" if "EXP" in transaction_id else "income"
+        record = fetch_transaction_record(transaction_id, record_type)
+        if not record:
+            raise ValueError(f"Transaction {transaction_id} not found in database.")
+        
+        # 3. Call unified orchestrator
+        result = process_upload(
+            record_id=record.id,
+            transaction_id=transaction_id,
+            file_bytes=file_bytes,
+            mime_type=mime_type,
+            file_index=1,
+            record_type=record_type,
+            submitted_by_id=user_id,
+            submitted_by_name="Slack User"
+        )
+        
+        # 4. Notify success with Done button
+        blocks = _build_done_button(record_type, transaction_id)
+        slack_app.client.chat_postMessage(
+            channel=user_id,
+            blocks=blocks,
+            text=f"File processed for {transaction_id}"
+        )
+        logger.info(f"PIPELINE COMPLETED | txn={transaction_id}")
+
+    except Exception as e:
+        logger.error(f"PIPELINE FAILED: {str(e)}")
+        
+        db = SessionLocal()
+        try:
+            record_type = "expense" if "EXP" in transaction_id else "income"
+            from models import Income, Expense
+            ModelClass = Expense if record_type == "expense" else Income
+            record = db.query(ModelClass).filter(ModelClass.transaction_id == transaction_id).first()
+            if record:
+                record.status = "FAILED"
+                db.commit()
+        except Exception as db_e:
+            logger.error(f"Failed to update status to FAILED: {db_e}")
+        finally:
+            db.close()
+            
+        msg = f"❌ Upload failed: {str(e)}"
+        slack_app.client.chat_postMessage(channel=user_id, text=msg)
+
+
 # ==============================
 # SLACK EVENTS ENDPOINT
 # ==============================
 @app.post("/slack/events", summary="Slack Events webhook endpoint")
-async def slack_events(request: Request):
-    logger.info("SLACK EVENT HIT")
+async def slack_events(request: Request, background_tasks: BackgroundTasks):
+    logger.info("SLACK EVENT RECEIVED")
+    
+    body_bytes = await request.body()
+    try:
+        payload = json.loads(body_bytes)
+    except Exception:
+        payload = {}
+
+    event_id = payload.get("event_id")
+    if is_event_processed(event_id):
+        return {"status": "duplicate ignored"}
+
+    if payload.get("type") == "url_verification":
+        return {"challenge": payload.get("challenge")}
+
+    event = payload.get("event", {})
+    
+    # INTERCEPT FILE UPLOADS
+    if event.get("type") == "message" and event.get("subtype") == "file_share":
+        if "files" in event and len(event["files"]) > 0:
+            file_info = event["files"][0]
+            file_url = file_info.get("url_private_download") or file_info.get("url_private")
+            user_id = event.get("user")
+            
+            text = event.get("text", "")
+            transaction_id = extract_txn_from_message(text)
+            
+            if not transaction_id:
+                slack_app.client.chat_postMessage(
+                    channel=user_id, 
+                    text="❌ Upload failed: No transaction ID found in the message text. Please include it (e.g. INC-1234)."
+                )
+                return {"status": "ok"}
+            
+            if file_url:
+                background_tasks.add_task(process_from_slack_file, transaction_id, file_url, user_id)
+                return {"status": "ok"}
+
+    # DELEGATE TO BOLT FOR EVERYTHING ELSE
+    async def mock_receive():
+        return {"type": "http.request", "body": body_bytes}
+    request._receive = mock_receive
+    
     return await handler.handle(request)
 
 
@@ -1075,16 +1051,46 @@ def create_income(income: IncomeCreate, db: Session = Depends(get_db)):
 # ==============================
 # FILE UPLOAD (EXPENSE)
 # ==============================
-@app.post("/expense/{id}/upload-receipt", summary="Upload receipt image for an expense")
-async def upload_receipt(id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+@app.post("/expense/upload-receipt", summary="Upload receipt image for an expense")
+async def upload_receipt(transaction_id: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    if not transaction_id:
+        raise HTTPException(status_code=400, detail="transaction_id is required")
+
     data = await file.read()
-    expense = db.query(Expense).filter(Expense.id == id).first()
+    expense = db.query(Expense).filter(Expense.transaction_id == transaction_id).first()
     if not expense:
         raise HTTPException(status_code=404, detail="Expense not found")
         
-    expense.receipt_copy = data
-    db.commit()
-    return {"status": "success", "message": "Receipt uploaded"}
+    print("FLOW: REST")
+    print("transaction_id:", transaction_id)
+    print("resolved record_id:", expense.id)
+    
+    existing_screenshots = expense.receipt_copies or []
+    file_index = len(existing_screenshots) + 1
+    
+    try:
+        result = process_upload(
+            record_id=expense.id,
+            transaction_id=transaction_id,
+            file_bytes=data,
+            mime_type=file.content_type,
+            file_index=file_index,
+            record_type="expense",
+            submitted_by_id="API_USER",
+            submitted_by_name="API Upload"
+        )
+        print("file_url:", result.get("file_url"))
+        
+        # Verify db update
+        db.refresh(expense)
+        if not expense.receipt_copy:
+            raise Exception("Upload failed: receipt_copy is still NULL after update")
+            
+    except Exception as e:
+        logger.error(f"process_upload failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+        
+    return {"status": "success", "message": "Receipt uploaded", "data": result}
 
 
 # ==============================
@@ -1105,16 +1111,46 @@ def get_receipt(id: int, db: Session = Depends(get_db)):
 # ==============================
 # UPLOAD INCOME SCREENSHOT
 # ==============================
-@app.post("/income/{id}/upload-screenshot", summary="Upload screenshot image for an income")
-async def upload_income_screenshot(id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+@app.post("/income/upload-screenshot", summary="Upload screenshot image for an income")
+async def upload_income_screenshot(transaction_id: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    if not transaction_id:
+        raise HTTPException(status_code=400, detail="transaction_id is required")
+
     data = await file.read()
-    income = db.query(Income).filter(Income.id == id).first()
+    income = db.query(Income).filter(Income.transaction_id == transaction_id).first()
     if not income:
         raise HTTPException(status_code=404, detail="Income not found")
         
-    income.payment_screenshot = data
-    db.commit()
-    return {"status": "success", "message": "Screenshot uploaded"}
+    print("FLOW: REST")
+    print("transaction_id:", transaction_id)
+    print("resolved record_id:", income.id)
+    
+    existing_screenshots = income.payment_screenshots or []
+    file_index = len(existing_screenshots) + 1
+    
+    try:
+        result = process_upload(
+            record_id=income.id,
+            transaction_id=transaction_id,
+            file_bytes=data,
+            mime_type=file.content_type,
+            file_index=file_index,
+            record_type="income",
+            submitted_by_id="API_USER",
+            submitted_by_name="API Upload"
+        )
+        print("file_url:", result.get("file_url"))
+        
+        # Verify db update
+        db.refresh(income)
+        if not income.payment_screenshot:
+            raise Exception("Upload failed: payment_screenshot is still NULL after update")
+
+    except Exception as e:
+        logger.error(f"process_upload failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+        
+    return {"status": "success", "message": "Screenshot uploaded", "data": result}
 
 
 # ==============================
@@ -1185,7 +1221,24 @@ async def submit_income_endpoint(
             "receipt_by": receipt_by
         }
         
-        record_id = insert_income_form_record(data, file_bytes)
+        record_id, transaction_id = insert_income_form_record(data)
+
+        # File upload through the pipeline
+        try:
+            mime_type = payment_screenshot.content_type or "image/jpeg"
+            process_upload(
+                record_id=record_id,
+                transaction_id=transaction_id,
+                file_bytes=file_bytes,
+                mime_type=mime_type,
+                file_index=1,
+                record_type="income",
+                submitted_by_id="API_USER",
+                submitted_by_name="API Upload"
+            )
+        except Exception as e:
+            logger.error(f"process_upload failed: {e}")
+            return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
         return {
             "status": "success",
