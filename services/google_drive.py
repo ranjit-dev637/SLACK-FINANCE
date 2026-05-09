@@ -131,6 +131,21 @@ def _is_retryable(exc: Exception) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def upload_to_drive(file_bytes: bytes, filename: str, record_type: str, mime_type: str = None):
+    # ── Pre-upload Validation ───────────────────────────────────────────────
+    if not file_bytes or len(file_bytes) < 1000:
+        raise RuntimeError("Invalid file: too small (under 1000 bytes)")
+        
+    if file_bytes.startswith(b"<"):
+        raise RuntimeError("Invalid file: HTML error response detected instead of binary file")
+        
+    is_valid_magic = (
+        file_bytes.startswith(b'\xff\xd8') or
+        file_bytes.startswith(b'\x89PNG') or
+        file_bytes.startswith(b'%PDF')
+    )
+    if not is_valid_magic:
+        raise RuntimeError("Invalid file format: Magic bytes do not match JPEG, PNG, or PDF")
+
     service = _get_drive_service()
     
     folder_id = "1Gu4bTRjIca6fR0iB65aJKVMMmkhpsnx-" if record_type.lower() == "income" else "1szvLU69NixqunsK0u-kooVjpvAZxxNmw"
@@ -145,23 +160,35 @@ def upload_to_drive(file_bytes: bytes, filename: str, record_type: str, mime_typ
     media = MediaIoBaseUpload(
         io.BytesIO(file_bytes), 
         mimetype=mime_type or 'image/jpeg',
-        resumable=True
+        resumable=True,
+        chunksize=5*1024*1024
     )
 
     try:
         file = service.files().create(
             body=file_metadata,
             media_body=media,
-            fields='id,webViewLink,name'
+            fields='id,name'
         ).execute()
         
+        file_id = file.get('id')
+        
+        # Verify size
+        uploaded_file = service.files().get(fileId=file_id, fields="size").execute()
+        uploaded_size = int(uploaded_file.get('size', 0))
+        local_size = len(file_bytes)
+        
+        if uploaded_size != local_size:
+            service.files().delete(fileId=file_id).execute()
+            raise RuntimeError(f"Drive upload corrupt: uploaded size ({uploaded_size}) != local size ({local_size})")
+
         # ── Make the file publicly readable ────────────────────────────
         service.permissions().create(
-            fileId=file.get('id'),
+            fileId=file_id,
             body={"type": "anyone", "role": "reader"},
         ).execute()
         
-        link = file.get('webViewLink')
+        link = f"https://drive.google.com/file/d/{file_id}/view"
         print(f"✅ Upload successful: {link}")
         return link
     except Exception as e:

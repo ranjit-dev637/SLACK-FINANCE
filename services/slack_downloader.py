@@ -70,26 +70,13 @@ def get_file_url(slack_file: dict) -> str:
 
 
 def download_slack_file(
-    slack_file: dict,
+    slack_file_url: str,
     max_retries: int = _MAX_RETRIES,
     timeout: int = _TIMEOUT,
-) -> bytes:
+) -> tuple[bytes, str]:
     """
-    Download a private Slack file, returning its raw bytes.
-
-    Args:
-        slack_file:   The file dict from a Slack event payload.
-        max_retries:  Number of download attempts before raising.
-        timeout:      Per-request timeout in seconds.
-
-    Returns:
-        Raw file bytes.
-
-    Raises:
-        RuntimeError: On repeated download failures, HTTP errors, or corrupt data.
+    Download a private Slack file, returning its raw bytes and resolved MIME type.
     """
-    url = slack_file.get("url_private_download") or slack_file.get("url_private")
-
     token = _SLACK_BOT_TOKEN
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -97,67 +84,55 @@ def download_slack_file(
 
     for attempt in range(1, max_retries + 1):
         logger.info(
-            f"[slack_downloader] Attempt {attempt}/{max_retries} | url={url}"
+            f"[slack_downloader] Attempt {attempt}/{max_retries} | url={slack_file_url}"
         )
         try:
             response = requests.get(
-                url,
+                slack_file_url,
                 headers=headers,
-                stream=True,    # binary-safe — prevents any automatic decoding
+                stream=True,
                 timeout=timeout,
             )
 
-            # ── HTTP status check ──────────────────────────────────────────
-            if response.status_code == 401:
-                raise RuntimeError(
-                    "Slack returned 401 Unauthorized. "
-                    "Check that SLACK_BOT_TOKEN is correct and the app has "
-                    "'files:read' scope. Reinstall the app if the scope was "
-                    "recently added."
-                )
-            if response.status_code == 403:
-                raise RuntimeError(
-                    "Slack returned 403 Forbidden. "
-                    "The bot may not be a member of the channel where the file "
-                    "was shared. Use /invite @your-bot in that channel."
-                )
             if response.status_code != 200:
                 raise RuntimeError(
                     f"Slack returned HTTP {response.status_code} for file download."
                 )
 
-            # ── Content-Type guard (HTML = bad auth or wrong URL) ──────────
-            content_type = response.headers.get("Content-Type", "")
-            if "text/html" in content_type:
+            file_bytes = response.content
+
+            if len(file_bytes) < 1000:
                 raise RuntimeError(
-                    "Slack returned HTML instead of the file. "
-                    "This usually means the bot token is invalid or the URL has expired."
+                    f"Invalid file: too small ({len(file_bytes)} bytes)."
                 )
 
-            # ── Read raw bytes ─────────────────────────────────────────────
-            file_bytes = response.content   # complete binary payload
-
-            # ── Integrity check ────────────────────────────────────────────
-            if not file_bytes or len(file_bytes) < _MIN_FILE_SIZE:
+            if file_bytes.startswith(b"<"):
                 raise RuntimeError(
-                    f"Downloaded file is empty or too small "
-                    f"({len(file_bytes) if file_bytes else 0} bytes). "
-                    "The file may be corrupt or the download was truncated."
+                    "Slack returned HTML instead of the file. This usually means the bot token is invalid or the URL has expired."
                 )
+
+            resolved_mime = None
+            if file_bytes.startswith(b'\xff\xd8'):
+                resolved_mime = "image/jpeg"
+            elif file_bytes.startswith(b'\x89PNG\x0d\x0a\x1a\x0a') or file_bytes.startswith(b'\x89PNG'):
+                resolved_mime = "image/png"
+            elif file_bytes.startswith(b'%PDF'):
+                resolved_mime = "application/pdf"
+            else:
+                raise RuntimeError("Invalid file format: Magic bytes do not match JPEG, PNG, or PDF.")
 
             logger.info(
                 f"[slack_downloader] Download successful | "
-                f"size={len(file_bytes)} bytes | attempt={attempt}"
+                f"size={len(file_bytes)} bytes | mime={resolved_mime} | attempt={attempt}"
             )
-            return file_bytes
+            return file_bytes, resolved_mime
 
         except RuntimeError:
-            # RuntimeErrors are definitive failures — do not retry
             raise
 
         except Exception as e:
             last_error = e
-            wait = _BACKOFF_BASE * (2 ** (attempt - 1))  # 1.5 → 3 → 6 seconds
+            wait = _BACKOFF_BASE * (2 ** (attempt - 1))
             logger.warning(
                 f"[slack_downloader] Attempt {attempt} failed: {e} | "
                 f"retrying in {wait:.1f}s..."

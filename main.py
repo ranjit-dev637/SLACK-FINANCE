@@ -81,7 +81,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+@app.get("/", tags=["Health"])
+def root():
+    return {
+        "status": "ok",
+        "service": "TransactFlow API",
+        "message": "API is running successfully"
+    }
 
+@app.get("/favicon.ico")
+def favicon():
+    return {}
 
 # ==============================
 # HEALTH CHECK
@@ -152,7 +162,7 @@ slack_app = SlackApp(
     process_before_response=True,
 )
 
-handler = SlackRequestHandler(slack_app)
+app_handler = SlackRequestHandler(slack_app)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DB HELPERS & BLOCK KIT MESSAGE BUILDERS
@@ -281,603 +291,555 @@ class TransactionCreate(BaseModel):
 
 
 
-# ==============================
-# SLACK COMMAND: /expense
-# ==============================
-@slack_app.command("/expense")
-def open_expense(ack, body, client, logger):
-    # STEP 1: Acknowledge immediately — must happen within 3 seconds
-    ack()
-
-    # STEP 2: Open the modal in a background thread so the handler returns instantly
-    try:
-        client.views_open(
-            trigger_id=body["trigger_id"],
-            view={
-                "type": "modal",
-                "callback_id": "expense_modal",
-                "title": {"type": "plain_text", "text": "Submit Expense"},
-                "submit": {"type": "plain_text", "text": "Submit"},
-                "blocks": [
-                    {
-                        "type": "input",
-                        "block_id": "expense_name_block",
-                        "element": {"type": "plain_text_input", "action_id": "expense_name"},
-                        "label": {"type": "plain_text", "text": "Expense Name"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "seller_name_block",
-                        "element": {"type": "plain_text_input", "action_id": "seller_name"},
-                        "label": {"type": "plain_text", "text": "Seller Name"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "gst_amount_block",
-                        "element": {
-                            "type": "plain_text_input",
-                            "action_id": "gst_amount",
-                            "initial_value": "0",
-                            "placeholder": {"type": "plain_text", "text": "e.g. 150"}
-                        },
-                        "label": {"type": "plain_text", "text": "GST Amount"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "total_amount_block",
-                        "element": {
-                            "type": "plain_text_input",
-                            "action_id": "total_amount",
-                            "placeholder": {"type": "plain_text", "text": "e.g. 1500"}
-                        },
-                        "label": {"type": "plain_text", "text": "Total Amount"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "purchase_date_block",
-                        "element": {
-                            "type": "datepicker",
-                            "action_id": "purchase_date_input",
-                            "placeholder": {"type": "plain_text", "text": "Select purchase date"}
-                        },
-                        "label": {"type": "plain_text", "text": "Purchase Date"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "priority_block",
-                        "element": {
-                            "type": "static_select",
-                            "action_id": "priority",
-                            "placeholder": {"type": "plain_text", "text": "Select priority"},
-                            "options": [
-                                {"text": {"type": "plain_text", "text": "Critical \u26a0\ufe0f"}, "value": "Critical"},
-                                {"text": {"type": "plain_text", "text": "High"},            "value": "High"},
-                                {"text": {"type": "plain_text", "text": "Medium"},          "value": "Medium"},
-                                {"text": {"type": "plain_text", "text": "Low"},             "value": "Low"}
-                            ]
-                        },
-                        "label": {"type": "plain_text", "text": "Priority"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "paid_by_block",
-                        "element": {"type": "plain_text_input", "action_id": "paid_by"},
-                        "label": {"type": "plain_text", "text": "Paid By"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "mode_of_payment_block",
-                        "element": {
-                            "type": "static_select",
-                            "action_id": "mode_of_payment",
-                            "placeholder": {"type": "plain_text", "text": "Select payment mode"},
-                            "options": [
-                                {"text": {"type": "plain_text", "text": "Cash"},        "value": "Cash"},
-                                {"text": {"type": "plain_text", "text": "Bank"},        "value": "Bank"},
-                                {"text": {"type": "plain_text", "text": "UPI"},         "value": "UPI"},
-                                {"text": {"type": "plain_text", "text": "Credit Card"}, "value": "Credit Card"},
-                                {"text": {"type": "plain_text", "text": "Petty Cash"},  "value": "Petty Cash"},
-                                {"text": {"type": "plain_text", "text": "Company"},     "value": "Company"}
-                            ]
-                        },
-                        "label": {"type": "plain_text", "text": "Mode Of Payment"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "property_block",
-                        "element": {
-                            "type": "radio_buttons",
-                            "action_id": "property",
-                            "options": PROPERTIES
-                        },
-                        "label": {"type": "plain_text", "text": "Property"}
-                    }
-                ]
-            }
-        )
-    except Exception as e:
-        logger.error(f"Failed to open /expense modal: {str(e)}")
-        try:
-            user_id = body.get("user_id")
-            if user_id:
-                client.chat_postMessage(
-                    channel=user_id,
-                    text="\u274c Could not open the expense form. Please try again."
-                )
-        except Exception:
-            pass
-
 
 # ==============================
-# SLACK COMMAND: /income
+# SLASH COMMANDS
 # ==============================
 @slack_app.command("/income")
-def handle_income(ack, body, client, logger):
-    # STEP 1: ACK IMMEDIATELY (MANDATORY)
+def handle_income_command(ack, body, client):
+    print("SLASH COMMAND RECEIVED")
     ack()
+    print("ACK SENT")
+    print("OPENING MODAL")
+    client.views_open(
+        trigger_id=body["trigger_id"],
+        view=get_income_modal()
+    )
+    print("MODAL OPENED")
 
-    # STEP 2: GET TRIGGER ID
-    print("SLACK BODY:", body)
-    trigger_id = body.get("trigger_id")
+@slack_app.command("/expense")
+def handle_expense_command(ack, body, client):
+    print("SLASH COMMAND RECEIVED")
+    ack()
+    print("ACK SENT")
+    print("OPENING MODAL")
+    client.views_open(
+        trigger_id=body["trigger_id"],
+        view=get_expense_modal()
+    )
+    print("MODAL OPENED")
 
-    if not trigger_id:
-        logger.error("No trigger_id found in the request body.")
-        return
 
-    # STEP 3: OPEN MODAL (WITHIN 3 SECONDS)
+# ==============================
+# MODAL DEFINITIONS
+# ==============================
+def get_income_modal():
+    return {
+        "type": "modal",
+        "callback_id": "income_form",
+        "title": {"type": "plain_text", "text": "Record Income"},
+        "submit": {"type": "plain_text", "text": "Submit"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            # ── SECTION 1: Property & Customer Details ──
+            {"type": "header", "text": {"type": "plain_text", "text": "Property & Guest Details"}},
+            {
+                "type": "input",
+                "block_id": "income_property",
+                "element": {
+                    "type": "radio_buttons",
+                    "action_id": "property_input",
+                    "options": [
+                        {"text": {"type": "plain_text", "text": "Clover Villa"}, "value": "Clover Villa"},
+                        {"text": {"type": "plain_text", "text": "Clovera"}, "value": "Clovera"},
+                        {"text": {"type": "plain_text", "text": "Clover Woods"}, "value": "Clover Woods"},
+                        {"text": {"type": "plain_text", "text": "Clover Connect"}, "value": "Clover Connect"},
+                    ]
+                },
+                "label": {"type": "plain_text", "text": "Property"}
+            },
+            {
+                "type": "input",
+                "block_id": "income_name",
+                "element": {"type": "plain_text_input", "action_id": "name_input", "placeholder": {"type": "plain_text", "text": "Guest / Customer name"}},
+                "label": {"type": "plain_text", "text": "Name"}
+            },
+            {
+                "type": "input",
+                "block_id": "income_receipt_date",
+                "element": {"type": "datepicker", "action_id": "receipt_date_input"},
+                "label": {"type": "plain_text", "text": "Receipt Date"}
+            },
+            {
+                "type": "input",
+                "block_id": "income_booking",
+                "element": {"type": "plain_text_input", "action_id": "booking_input", "placeholder": {"type": "plain_text", "text": "Booking number"}},
+                "label": {"type": "plain_text", "text": "Booking Number"}
+            },
+
+            # ── SECTION 2: Payment Details ──
+            {"type": "header", "text": {"type": "plain_text", "text": "Payment Details"}},
+            {
+                "type": "input",
+                "block_id": "income_payment_type",
+                "element": {
+                    "type": "static_select",
+                    "action_id": "payment_type_input",
+                    "placeholder": {"type": "plain_text", "text": "Select payment type"},
+                    "options": [
+                        {"text": {"type": "plain_text", "text": "Cash"}, "value": "Cash"},
+                        {"text": {"type": "plain_text", "text": "Bank Transfer"}, "value": "Bank Transfer"},
+                        {"text": {"type": "plain_text", "text": "UPI"}, "value": "UPI"},
+                        {"text": {"type": "plain_text", "text": "Credit Card"}, "value": "Credit Card"},
+                        {"text": {"type": "plain_text", "text": "ICICI Bank POS"}, "value": "ICICI Bank POS"},
+                        {"text": {"type": "plain_text", "text": "HDFC Bank POS"}, "value": "HDFC Bank POS"},
+                        {"text": {"type": "plain_text", "text": "QR Code Standy (ICICI)"}, "value": "QR Code Standy (ICICI)"},
+                    ]
+                },
+                "label": {"type": "plain_text", "text": "Payment Type"}
+            },
+            {
+                "type": "input",
+                "block_id": "income_room_amount",
+                "element": {"type": "plain_text_input", "action_id": "room_amount_input", "placeholder": {"type": "plain_text", "text": "0"}},
+                "label": {"type": "plain_text", "text": "Amount Collected for Room"}
+            },
+            {
+                "type": "input",
+                "block_id": "income_food_amount",
+                "element": {"type": "plain_text_input", "action_id": "food_amount_input", "placeholder": {"type": "plain_text", "text": "0"}},
+                "label": {"type": "plain_text", "text": "Amount Collected for Food"}
+            },
+
+            # ── SECTION 4: Receipt By ──
+            {"type": "header", "text": {"type": "plain_text", "text": "Submission Details"}},
+            {
+                "type": "input",
+                "block_id": "income_receipt_by",
+                "element": {"type": "plain_text_input", "action_id": "receipt_by_input", "placeholder": {"type": "plain_text", "text": "Who received the payment?"}},
+                "label": {"type": "plain_text", "text": "Receipt By"}
+            }
+        ]
+    }
+
+def get_expense_modal():
+    return {
+        "type": "modal",
+        "callback_id": "expense_form",
+        "title": {"type": "plain_text", "text": "Record Expense"},
+        "submit": {"type": "plain_text", "text": "Submit"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            # ── SECTION 1: Expense Details ──
+            {"type": "header", "text": {"type": "plain_text", "text": "Expense Details"}},
+            {
+                "type": "input",
+                "block_id": "expense_name",
+                "element": {"type": "plain_text_input", "action_id": "name_input", "placeholder": {"type": "plain_text", "text": "What was purchased?"}},
+                "label": {"type": "plain_text", "text": "Expense Name"}
+            },
+            {
+                "type": "input",
+                "block_id": "expense_seller",
+                "element": {"type": "plain_text_input", "action_id": "seller_input", "placeholder": {"type": "plain_text", "text": "Seller / Vendor name"}},
+                "label": {"type": "plain_text", "text": "Seller Name"}
+            },
+            {
+                "type": "input",
+                "block_id": "expense_gst",
+                "optional": True,
+                "element": {"type": "plain_text_input", "action_id": "gst_input", "placeholder": {"type": "plain_text", "text": "0"}},
+                "label": {"type": "plain_text", "text": "GST Amount (₹)"}
+            },
+            {
+                "type": "input",
+                "block_id": "expense_total",
+                "element": {"type": "plain_text_input", "action_id": "total_input", "placeholder": {"type": "plain_text", "text": "Total amount"}},
+                "label": {"type": "plain_text", "text": "Total Amount (₹)"}
+            },
+            {
+                "type": "input",
+                "block_id": "expense_date",
+                "element": {"type": "datepicker", "action_id": "date_input"},
+                "label": {"type": "plain_text", "text": "Purchase Date"}
+            },
+            # ── SECTION 2: Priority ──
+            {"type": "header", "text": {"type": "plain_text", "text": "Priority"}},
+            {
+                "type": "input",
+                "block_id": "expense_priority",
+                "element": {
+                    "type": "static_select",
+                    "action_id": "priority_input",
+                    "options": [
+                        {"text": {"type": "plain_text", "text": "Critical"}, "value": "Critical"},
+                        {"text": {"type": "plain_text", "text": "High"}, "value": "High"},
+                        {"text": {"type": "plain_text", "text": "Medium"}, "value": "Medium"},
+                        {"text": {"type": "plain_text", "text": "Low"}, "value": "Low"},
+                    ]
+                },
+                "label": {"type": "plain_text", "text": "Priority"}
+            },
+
+            # ── SECTION 3: Payment Method ──
+            {"type": "header", "text": {"type": "plain_text", "text": "Payment Method"}},
+            {
+                "type": "input",
+                "block_id": "expense_paid_by",
+                "element": {"type": "plain_text_input", "action_id": "paid_by_input", "placeholder": {"type": "plain_text", "text": "Who paid?"}},
+                "label": {"type": "plain_text", "text": "Paid By"}
+            },
+            {
+                "type": "input",
+                "block_id": "expense_mode",
+                "element": {
+                    "type": "static_select",
+                    "action_id": "mode_input",
+                    "options": [
+                        {"text": {"type": "plain_text", "text": "Cash"}, "value": "Cash"},
+                        {"text": {"type": "plain_text", "text": "Bank"}, "value": "Bank"},
+                        {"text": {"type": "plain_text", "text": "UPI"}, "value": "UPI"},
+                        {"text": {"type": "plain_text", "text": "Credit Card"}, "value": "Credit Card"},
+                        {"text": {"type": "plain_text", "text": "Petty Cash"}, "value": "Petty Cash"},
+                        {"text": {"type": "plain_text", "text": "Company"}, "value": "Company"},
+                    ]
+                },
+                "label": {"type": "plain_text", "text": "Mode of Payment"}
+            },
+
+            # ── SECTION 4: Property Selection ──
+            {"type": "header", "text": {"type": "plain_text", "text": "Property Selection"}},
+            {
+                "type": "input",
+                "block_id": "expense_property",
+                "element": {
+                    "type": "radio_buttons",
+                    "action_id": "property_input",
+                    "options": [
+                        {"text": {"type": "plain_text", "text": "Clover Villa"}, "value": "Clover Villa"},
+                        {"text": {"type": "plain_text", "text": "Kitchen"}, "value": "Kitchen"},
+                        {"text": {"type": "plain_text", "text": "Clovera"}, "value": "Clovera"},
+                        {"text": {"type": "plain_text", "text": "Clover Woods"}, "value": "Clover Woods"},
+                        {"text": {"type": "plain_text", "text": "Central"}, "value": "Central"},
+                        {"text": {"type": "plain_text", "text": "Default"}, "value": "Default"},
+                        {"text": {"type": "plain_text", "text": "Clover Connect"}, "value": "Clover Connect"},
+                    ]
+                },
+                "label": {"type": "plain_text", "text": "Property"}
+            }
+        ]
+    }
+
+
+# ==============================
+# MODAL SUBMISSION HANDLERS
+# ==============================
+@slack_app.view("income_form")
+def handle_income_submission(ack, body, client, view):
     try:
-        client.views_open(
-            trigger_id=trigger_id,
-            view={
-                "type": "modal",
-                "callback_id": "income_modal",
-                "title": {"type": "plain_text", "text": "Submit Income"},
-                "submit": {"type": "plain_text", "text": "Submit"},
-                "blocks": [
-                    {
-                        "type": "input",
-                        "block_id": "for_property",
-                        "element": {
-                            "type": "radio_buttons",
-                            "action_id": "value",
-                            "options": PROPERTIES
-                        },
-                        "label": {"type": "plain_text", "text": "Select Property"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "name_block",
-                        "element": {"type": "plain_text_input", "action_id": "name"},
-                        "label": {"type": "plain_text", "text": "Customer Name"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "booking_block",
-                        "element": {"type": "plain_text_input", "action_id": "booking"},
-                        "label": {"type": "plain_text", "text": "Booking Number"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "payment_type",
-                        "element": {
-                            "type": "static_select",
-                            "action_id": "value",
-                            "placeholder": {"type": "plain_text", "text": "Select payment method"},
-                            "options": [
-                                {"text": {"type": "plain_text", "text": "Cash"}, "value": "Cash"},
-                                {"text": {"type": "plain_text", "text": "Bank Transfer"}, "value": "Bank Transfer"},
-                                {"text": {"type": "plain_text", "text": "UPI"}, "value": "UPI"},
-                                {"text": {"type": "plain_text", "text": "Credit Card"}, "value": "Credit Card"},
-                                {"text": {"type": "plain_text", "text": "ICICI Bank POS"}, "value": "ICICI Bank POS"},
-                                {"text": {"type": "plain_text", "text": "HDFC Bank POS"}, "value": "HDFC Bank POS"},
-                                {"text": {"type": "plain_text", "text": "QR Code Standy (ICICI)"}, "value": "QR Code Standy (ICICI)"}
-                            ]
-                        },
-                        "label": {"type": "plain_text", "text": "Payment Type"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "room_block",
-                        "element": {"type": "plain_text_input", "action_id": "room"},
-                        "label": {"type": "plain_text", "text": "Room Amount"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "food_block",
-                        "element": {"type": "plain_text_input", "action_id": "food", "initial_value": "0"},
-                        "label": {"type": "plain_text", "text": "Food Amount"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "receipt_block",
-                        "element": {"type": "plain_text_input", "action_id": "receipt"},
-                        "label": {"type": "plain_text", "text": "Receipt By"}
-                    },
-                    {
-                        "type": "input",
-                        "block_id": "receipt_date",
-                        "optional": True,
-                        "element": {
-                            "type": "datepicker",
-                            "action_id": "receipt_date_input",
-                            "placeholder": {"type": "plain_text", "text": "Select receipt date"}
-                        },
-                        "label": {"type": "plain_text", "text": "Receipt Date"}
-                    }
-                ]
-            }
-        )
-    except Exception as e:
-        logger.error(f"Modal error: {str(e)}")
+        ack()
+        logger.info("ACK SENT")
+        logger.info("INCOME SUBMISSION RECEIVED")
+        user_id = body["user"]["id"]
+        values = view["state"]["values"]
 
-# ==============================
-# SUBMIT HANDLER: EXPENSE
-# ==============================
-@slack_app.view("expense_modal")
-def handle_expense_modal(ack, body, client, logger):
-    ack()
+        # ── Extract all form fields ──
+        property_val = values["income_property"]["property_input"]["selected_option"]["value"]
+        name = values["income_name"]["name_input"]["value"]
+        receipt_date_str = values["income_receipt_date"]["receipt_date_input"].get("selected_date")
+        booking_number = values["income_booking"]["booking_input"]["value"]
+        payment_type = values["income_payment_type"]["payment_type_input"]["selected_option"]["value"]
+        room_amount = safe_float(values["income_room_amount"]["room_amount_input"]["value"])
+        food_amount = safe_float(values["income_food_amount"]["food_amount_input"]["value"])
+        receipt_by = values["income_receipt_by"]["receipt_by_input"]["value"]
+        
+        logger.info("FIELDS EXTRACTED")
 
-    def _process_expense():
-        logger.info("THREAD STARTED")
-        try:
-            user_id      = body.get("user", {}).get("id")
-            state_values = body.get("view", {}).get("state", {}).get("values", {})
-            # Extract
-            expense_name     = state_values["expense_name_block"]["expense_name"]["value"]
-            seller_name      = state_values["seller_name_block"]["seller_name"]["value"]
-            gst_amount_str   = state_values["gst_amount_block"]["gst_amount"]["value"]
-            total_amount_str = state_values["total_amount_block"]["total_amount"]["value"]
-            purchase_date_str = state_values["purchase_date_block"]["purchase_date_input"]["selected_date"]
-            priority         = state_values["priority_block"]["priority"]["selected_option"]["value"]
-            paid_by          = state_values["paid_by_block"]["paid_by"]["value"]
-            mode_of_payment  = state_values["mode_of_payment_block"]["mode_of_payment"]["selected_option"]["value"]
-            property_name    = state_values["property_block"]["property"]["selected_option"]["value"]
-
-            # Validate
-            num_regex = re.compile(r"^\d+(\.\d+)?$")
-            errs = []
-            if not expense_name or not expense_name.strip():
-                errs.append("Expense name is required.")
-            if not seller_name or not seller_name.strip():
-                errs.append("Seller name is required.")
-            if not gst_amount_str or not num_regex.match(gst_amount_str.strip()):
-                errs.append("GST Amount must be a valid number (e.g. 0 or 150.50).")
-            if not total_amount_str or not num_regex.match(total_amount_str.strip()):
-                errs.append("Total Amount must be a valid number (e.g. 1500).")
-            if not paid_by or not paid_by.strip():
-                errs.append("Paid By is required.")
-            if not purchase_date_str:
-                errs.append("Purchase date is required.")
-            if errs:
-                client.chat_postMessage(
-                    channel=user_id,
-                    text="\u274c Expense submission failed:\n" + "\n".join(f"\u2022 {e}" for e in errs)
-                )
-                return
-
-            # Parse date
+        # ── Parse receipt date ──
+        receipt_date = None
+        if receipt_date_str:
             try:
-                purchase_date_obj = datetime.strptime(purchase_date_str, "%Y-%m-%d").date()
+                receipt_date = datetime.strptime(receipt_date_str, "%Y-%m-%d").date()
             except Exception:
-                purchase_date_obj = datetime.now().date()
+                receipt_date = datetime.now().date()
+        else:
+            receipt_date = datetime.now().date()
 
-            data = {
-                "user_id":         user_id,
-                "expense_name":    expense_name.strip(),
-                "seller_name":     seller_name.strip(),
-                "gst_amount":      float(gst_amount_str.strip()),
-                "total_amount":    float(total_amount_str.strip()),
-                "purchase_date":   purchase_date_obj,
-                "priority":        priority,
-                "paid_by":         paid_by.strip(),
-                "mode_of_payment": mode_of_payment,
-                "property_name":   property_name,
-            }
+        transaction_id = f"TXN-{uuid.uuid4().hex[:8]}"
+        logger.info("TRANSACTION ID GENERATED")
 
-            transaction_id = insert_expense_record(data)
-            logger.info(f"PENDING expense created | txn={transaction_id} | user={user_id}")
+        # ── Save PENDING record to DB ──
+        db = SessionLocal()
+        logger.info("DB SESSION CREATED")
+        try:
+            logger.info("INSERTING INCOME ROW")
+            new_income = Income(
+                transaction_id=transaction_id,
+                user_id=user_id,
+                status="PENDING",
+                file_uploaded=False,
+                submitted_at=datetime.utcnow(),
+                name=name,
+                booking_number=booking_number,
+                contact_number="N/A",
+                captured_date=receipt_date,
+                receipt_date=receipt_date,
+                room_amount=room_amount,
+                food_amount=food_amount,
+                payment_type=payment_type,
+                receipt_by=receipt_by,
+                for_property={"name": property_val},
+                submitted_by=user_id
+            )
+            logger.info("ABOUT TO INSERT TO DB")
+            db.add(new_income)
+            logger.info("DB COMMIT STARTED")
+            db.commit()
+            logger.info("DB COMMIT SUCCESS")
+            db.refresh(new_income)
+            record_id = new_income.id
+            logger.info("TRANSACTION SAVED:\n" + transaction_id)
+            logger.info(f"TRANSACTION CREATED: {transaction_id}")
+            logger.info(f"PENDING: {transaction_id}")
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Income modal submission DB error: {e}", exc_info=True)
+            try:
+                client.chat_postMessage(channel=user_id, text=f"❌ Error creating income record: {e}")
+            except Exception as msg_e:
+                logger.error(f"Failed to send DB error message: {msg_e}", exc_info=True)
+            return
+        finally:
+            db.close()
 
+        logger.info("ABOUT TO SEND MESSAGE")
+        try:
             client.chat_postMessage(
                 channel=user_id,
-                text=(
-                    f"\u2705 Expense submitted successfully.\n"
-                    f"Transaction ID: `{transaction_id}`\n"
-                    "\U0001f4ce Please upload the *receipt screenshot* to complete the submission."
-                )
+                text=f"✅ Income form received\n\nTransaction ID: {transaction_id}\n\n📎 Please upload the payment screenshot in this chat to complete the submission.\n\nStatus: PENDING"
             )
-            logger.info("THREAD COMPLETED")  # trace
-        except Exception as e:
-            logger.error(f"Thread crash: {str(e)}")
-            try:
-                user_id = body.get("user", {}).get("id")
-                if user_id:
-                    client.chat_postMessage(
-                        channel=user_id,
-                        text=f"\u274c An error occurred while saving your expense: {str(e)}"
-                    )
-            except Exception:
-                pass
+            logger.info("MESSAGE SENT SUCCESSFULLY")
+        except Exception as msg_e:
+            logger.error(f"Failed to send screenshot request message: {msg_e}", exc_info=True)
 
-    threading.Thread(target=_process_expense, daemon=True).start()
+    except Exception as top_e:
+        logger.error(f"handle_income_submission top-level exception: {top_e}", exc_info=True)
 
-
-
-# ==============================
-# SUBMIT HANDLER: INCOME
-# ==============================
-@slack_app.view("income_modal")
-def handle_income_modal(ack, body, client, logger):
+@slack_app.view("expense_form")
+def handle_expense_submission(ack, body, client, view):
     ack()
-
-    def _process_income():
-        logger.info("THREAD STARTED")
+    logger.info("EXPENSE SUBMISSION RECEIVED")
+    user_id = body["user"]["id"]
+    values = view["state"]["values"]
+    
+    expense_name = values["expense_name"]["name_input"]["value"]
+    seller_name = values["expense_seller"]["seller_input"]["value"]
+    total_amount = safe_float(values["expense_total"]["total_input"]["value"])
+    gst_amount = safe_float((values.get("expense_gst", {}).get("gst_input", {}) or {}).get("value", "0"))
+    purchase_date_str = values["expense_date"]["date_input"].get("selected_date")
+    paid_by = values["expense_paid_by"]["paid_by_input"]["value"]
+    mode_of_payment = values["expense_mode"]["mode_input"]["selected_option"]["value"]
+    priority = values["expense_priority"]["priority_input"]["selected_option"]["value"]
+    property_val = values["expense_property"]["property_input"]["selected_option"]["value"]
+    
+    purchase_date = None
+    if purchase_date_str:
         try:
-            user_id      = body.get("user", {}).get("id")
-            state_values = body.get("view", {}).get("state", {}).get("values", {})
-            # Extract
-            name            = state_values["name_block"]["name"]["value"]
-            booking_number  = state_values["booking_block"]["booking"]["value"]
-            room_amount_str = state_values["room_block"]["room"]["value"]
-            food_amount_str = state_values["food_block"]["food"]["value"]
-            receipt_by      = state_values["receipt_block"]["receipt"]["value"]
-            receipt_date    = (
-                state_values
-                .get("receipt_date", {})
-                .get("receipt_date_input", {})
-                .get("selected_date")
-            )
-            contact_number = (
-                state_values.get("contact_number", {})
-                .get("value", {}).get("value", "")
-            )
-            captured_date_str = (
-                state_values.get("captured_date", {})
-                .get("value", {}).get("selected_date", "")
-            )
-            payment_type = (
-                state_values.get("payment_type", {})
-                .get("value", {}).get("selected_option", {}).get("value", "")
-            )
-            property_name = (
-                state_values.get("for_property", {})
-                .get("value", {}).get("selected_option", {}).get("value", "")
-            )
-
-            # Validate
-            alpha_regex = re.compile(r"^[A-Za-z\s]+$")
-            errs = []
-            if not name or not alpha_regex.match(name):
-                errs.append("Customer Name: only alphabets allowed.")
-            if not booking_number or not booking_number.isdigit():
-                errs.append("Booking Number: only numbers allowed.")
-            if not room_amount_str or not room_amount_str.isdigit() or int(room_amount_str) <= 0:
-                errs.append("Room Amount: must be a positive number.")
-            if not food_amount_str or not food_amount_str.isdigit() or int(food_amount_str) < 0:
-                errs.append("Food Amount: must be a non-negative number.")
-            if not receipt_by or not alpha_regex.match(receipt_by):
-                errs.append("Receipt By: only alphabets allowed.")
-            if errs:
-                client.chat_postMessage(
-                    channel=user_id,
-                    text="\u274c Income submission failed:\n" + "\n".join(f"\u2022 {e}" for e in errs)
-                )
-                return
-
-            # Generate transaction_id
-            transaction_id = f"TXN-{uuid.uuid4().hex[:8]}"
-
-            # Parse dates
-            captured_dt = datetime.now().date()
-            if captured_date_str:
-                try:
-                    captured_dt = datetime.strptime(captured_date_str, "%Y-%m-%d").date()
-                except Exception:
-                    pass
-
-            receipt_dt = None
-            if receipt_date:
-                try:
-                    receipt_dt = datetime.strptime(receipt_date, "%Y-%m-%d").date()
-                except Exception:
-                    pass
-
-            db = SessionLocal()
-            try:
-                new_income = Income(
-                    transaction_id     = transaction_id,
-                    user_id            = user_id,
-                    status             = "PENDING",
-                    name               = name,
-                    booking_number     = booking_number,
-                    contact_number     = contact_number,
-                    captured_date      = captured_dt,
-                    room_amount        = float(room_amount_str),
-                    food_amount        = float(food_amount_str),
-                    receipt_by         = receipt_by,
-                    payment_type       = payment_type,
-                    for_property       = {"name": property_name},
-                    receipt_date       = receipt_dt,
-                    payment_screenshot = None,
-                    submitted_by       = user_id,
-                    submitted_at       = datetime.utcnow(),
-                )
-                db.add(new_income)
-                db.commit()
-                logger.info(
-                    f"PENDING income created | txn={transaction_id} | "
-                    f"user={user_id} | property={property_name}"
-                )
-            except Exception as e:
-                db.rollback()
-                logger.error(f"DB error creating PENDING income: {e}")
-                try:
-                    client.chat_postMessage(
-                        channel=user_id,
-                        text=f"❌ Database error while saving your submission: {str(e)}"
-                    )
-                except Exception:
-                    pass
-                return
-            finally:
-                db.close()
-
-            # Send the confirmation message to the user
-            try:
-                client.chat_postMessage(
-                    channel=user_id,
-                    text=(
-                        f"✅ Income form received (Transaction ID: `{transaction_id}`)\n"
-                        "📎 Please upload the payment screenshot to complete the submission."
-                    )
-                )
-                logger.info(f"Confirmation message sent to {user_id}")
-            except Exception as e:
-                logger.error(f"Failed to send confirmation message to {user_id}: {e}")
-
-            logger.info("THREAD COMPLETED")  # trace
-
-        except Exception as e:
-            logger.error(f"Thread crash: {str(e)}")
-            try:
-                user_id = body.get("user", {}).get("id")
-                if user_id:
-                    client.chat_postMessage(
-                        channel=user_id,
-                        text=f"\u274c An error occurred while processing your income form: {str(e)}"
-                    )
-            except Exception:
-                pass
-
-    threading.Thread(target=_process_income, daemon=True).start()
-
-
+            purchase_date = datetime.strptime(purchase_date_str, "%Y-%m-%d").date()
+        except Exception:
+            purchase_date = datetime.now().date()
+    else:
+        purchase_date = datetime.now().date()
+    
+    transaction_id = f"TXN-{uuid.uuid4().hex[:8]}"
+    logger.info("TRANSACTION ID GENERATED")
+    
+    db = SessionLocal()
+    logger.info("DB SESSION CREATED")
+    try:
+        logger.info("INSERTING EXPENSE ROW")
+        new_expense = Expense(
+            transaction_id=transaction_id,
+            user_id=user_id,
+            status="PENDING",
+            file_uploaded=False,
+            submitted_at=datetime.utcnow(),
+            expense_name=expense_name,
+            seller_name=seller_name,
+            total_amount=total_amount,
+            gst_amount=gst_amount,
+            purchase_date=purchase_date,
+            paid_by=paid_by,
+            mode_of_payment=mode_of_payment,
+            priority=priority,
+            for_property={"name": property_val},
+            submitted_by=user_id
+        )
+        db.add(new_expense)
+        logger.info("DB COMMIT STARTED")
+        db.commit()
+        logger.info("DB COMMIT SUCCESS")
+        db.refresh(new_expense)
+        record_id = new_expense.id
+        logger.info("TRANSACTION SAVED:\n" + transaction_id)
+        logger.info(f"TRANSACTION CREATED: {transaction_id}")
+        logger.info(f"PENDING: {transaction_id}")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Expense modal submission DB error: {e}", exc_info=True)
+        client.chat_postMessage(channel=user_id, text=f"❌ Error creating transaction: {e}")
+        return
+    finally:
+        db.close()
+        
+    client.chat_postMessage(
+        channel=user_id,
+        text=f"✅ Expense form received\n\nTransaction ID: {transaction_id}\n\n📎 Please upload the payment screenshot in this chat to complete the submission.\n\nStatus: PENDING"
+    )
 
 import collections
 import time
 import json
 
 # Thread-safe bounded cache for deduplicating Slack events
-PROCESSED_EVENTS = collections.OrderedDict()
-MAX_CACHE_SIZE = 1000
+PROCESSED_EVENTS = {}
 
-def is_event_processed(event_id: str) -> bool:
-    if not event_id:
-        return False
-    if event_id in PROCESSED_EVENTS:
-        return True
-    PROCESSED_EVENTS[event_id] = time.time()
-    if len(PROCESSED_EVENTS) > MAX_CACHE_SIZE:
-        PROCESSED_EVENTS.popitem(last=False)
-    return False
+def is_event_processed(event_id):
+    return event_id in PROCESSED_EVENTS
 
-def extract_txn_from_message(text: str) -> str | None:
-    if not text:
-        return None
-    match = re.search(r'\b(EXP-|INC-|TXN-)[A-Za-z0-9\-]+\b', text)
-    return match.group(0) if match else None
+def mark_event_processed(event_id):
+    if not event_id: return
+    PROCESSED_EVENTS[event_id] = True
 
-def _build_done_button(record_type: str, transaction_id: str):
-    return [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"✅ File successfully processed for *{transaction_id}*.\nClick *Done* when you have finished uploading all files for this transaction."
-            }
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {
-                        "type": "plain_text",
-                        "text": "Done",
-                        "emoji": True
-                    },
-                    "style": "primary",
-                    "action_id": "multi_upload_done",
-                    "value": f"{record_type}|{transaction_id}"
-                }
-            ]
-        }
-    ]
+def extract_txn_from_message(text: str, user_id: str) -> str | None:
+    import re
+    if text:
+        match = re.search(r'\bTXN-[a-z0-9]+\b', text)
+        if match:
+            return match.group(0)
 
-@slack_app.action("multi_upload_done")
-def handle_multi_upload_done(ack, body, client, logger):
-    ack()
+    db = SessionLocal()
     try:
-        user_id = body.get("user", {}).get("id")
-        action = body.get("actions", [])[0]
-        value = action.get("value", "")
+        from models import Income, Expense
         
-        if "|" not in value:
+        income = db.query(Income).filter(
+            Income.user_id == user_id,
+            Income.status == "PENDING",
+            Income.payment_screenshot == None
+        ).order_by(Income.submitted_at.desc()).first()
+        
+        expense = db.query(Expense).filter(
+            Expense.user_id == user_id,
+            Expense.status == "PENDING",
+            Expense.receipt_copy == None
+        ).order_by(Expense.submitted_at.desc()).first()
+        
+        most_recent = None
+        if income and expense:
+            if income.submitted_at > expense.submitted_at:
+                most_recent = income
+            else:
+                most_recent = expense
+        else:
+            most_recent = income or expense
+            
+        if most_recent:
+            return most_recent.transaction_id
+            
+    finally:
+        db.close()
+        
+    slack_app.client.chat_postMessage(
+        channel=user_id,
+        text="❌ No pending submission found. Please submit /income or /expense first."
+    )
+    return None
+
+def process_slack_file_event(event):
+    logger.info("PROCESS_SLACK_FILE_EVENT FUNCTION CALLED")
+    logger.info("THREAD EXECUTION CONFIRMED")
+    logger.info("PROCESS_SLACK_FILE_EVENT STARTED")
+    user_id = event.get("user") or event.get("user_id")
+    transaction_id = None
+    msg_ts = None
+    msg_channel = None
+    try:
+        file_info = None
+        text = event.get("text", "")
+        
+        if "files" in event and len(event["files"]) > 0:
+            file_info = event["files"][0]
+        elif event.get("type") == "file_shared" or event.get("file_id"):
+            file_id = event.get("file_id") or event.get("file", {}).get("id")
+            if file_id:
+                try:
+                    res = slack_app.client.files_info(file=file_id)
+                    file_info = res.get("file")
+                except Exception as e:
+                    logger.error(f"Failed to fetch file info: {e}")
+                    
+        if not file_info:
             return
             
-        record_type, transaction_id = value.split("|", 1)
+        file_url = file_info.get("url_private_download") or file_info.get("url_private")
         
+        if not file_url or not user_id:
+            return
+            
+        if is_event_processed(f"url_{file_url}"):
+            logger.info("FILE URL ALREADY PROCESSED - DUPLICATE THREAD PREVENTED")
+            return
+        mark_event_processed(f"url_{file_url}")
+            
+        transaction_id = extract_txn_from_message(text, user_id)
+        if not transaction_id:
+            logger.info("No PENDING transaction matched for the uploaded file.")
+            return
+            
+        logger.info(f"TRANSACTION MATCHED:\n{transaction_id}")
+            
         db = SessionLocal()
         try:
             from models import Income, Expense
-            ModelClass = Expense if record_type == "expense" else Income
-            record = db.query(ModelClass).filter(ModelClass.transaction_id == transaction_id).first()
+            
+            record_type = None
+            ModelClass = None
+            
+            # Lock record before update
+            record = db.query(Income).filter(Income.transaction_id == transaction_id).with_for_update().first()
             if record:
-                record.status = "COMPLETED"
-                db.commit()
+                record_type = "income"
+                ModelClass = Income
+            else:
+                record = db.query(Expense).filter(Expense.transaction_id == transaction_id).with_for_update().first()
+                if record:
+                    record_type = "expense"
+                    ModelClass = Expense
+                else:
+                    raise ValueError(f"Transaction {transaction_id} not found in database.")
                 
-                if body.get("message"):
-                    client.chat_update(
-                        channel=body["channel"]["id"],
-                        ts=body["message"]["ts"],
-                        blocks=[
-                            {
-                                "type": "section",
-                                "text": {
-                                    "type": "mrkdwn",
-                                    "text": f"✅ Transaction *{transaction_id}* marked as COMPLETED."
-                                }
-                            }
-                        ],
-                        text="Transaction completed."
-                    )
+            # Prevent duplicate file upload
+            if getattr(record, 'file_uploaded', False):
+                slack_app.client.chat_postMessage(
+                    channel=user_id,
+                    text=f"⚠️ Screenshot already uploaded for `{transaction_id}`. No action taken."
+                )
+                return
+                
+            record_id = record.id
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            raise e
         finally:
             db.close()
-    except Exception as e:
-        logger.error(f"Error handling multi_upload_done: {e}")
 
-def process_from_slack_file(transaction_id: str, file_url: str, user_id: str):
-    logger.info(f"PIPELINE STARTED | txn={transaction_id}")
-    try:
-        # 1. Fetch file bytes from Slack
-        headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
-        response = requests.get(file_url, headers=headers)
-        if response.status_code != 200:
-            raise RuntimeError("Slack file download failed")
+        # ── Send Initial Processing Message ──
+        processing_text = f"⏳ Screenshot detected\n\nTransaction ID: {transaction_id}\n\n🔄 Upload processing started...\n🔍 Verifying screenshot integrity...\n☁ Uploading to Google Drive...\n\nStatus: PROCESSING"
+        msg_response = slack_app.client.chat_postMessage(channel=user_id, text=processing_text)
+        msg_ts = msg_response["ts"]
+        msg_channel = msg_response["channel"]
+        logger.info("PROCESSING MESSAGE SENT")
+        logger.info(f"PROCESSING STARTED for {transaction_id}")
+
+        logger.info("UPLOAD PIPELINE STARTED")
+        logger.info(f"DOWNLOAD STARTED for {transaction_id}")
+        from services.slack_downloader import download_slack_file
+        file_bytes, mime_type = download_slack_file(file_url)
         
-        file_bytes = response.content
-        mime_type = response.headers.get("Content-Type", "image/jpeg")
-        logger.info(f"FILE DOWNLOADED | txn={transaction_id} | size={len(file_bytes)}")
-
-        if len(file_bytes) < 1000:
-            raise RuntimeError("Invalid file: too small")
-
-        if not file_bytes.startswith(b'\xff\xd8'):
-            raise RuntimeError("Invalid image format (not JPEG)")
-
-        if file_bytes.startswith(b'<'):
-            raise RuntimeError("Slack download returned HTML instead of file")
-
-        print("VALID FILE:", len(file_bytes))
-
-        # 2. Get DB record to satisfy process_upload requirements
-        record_type = "expense" if "EXP" in transaction_id else "income"
-        record = fetch_transaction_record(transaction_id, record_type)
-        if not record:
-            raise ValueError(f"Transaction {transaction_id} not found in database.")
-        
-        # 3. Call unified orchestrator
+        logger.info(f"VALIDATION PASSED / DRIVE UPLOAD STARTED for {transaction_id}")
         result = process_upload(
-            record_id=record.id,
+            record_id=record_id,
             transaction_id=transaction_id,
             file_bytes=file_bytes,
             mime_type=mime_type,
@@ -887,86 +849,184 @@ def process_from_slack_file(transaction_id: str, file_url: str, user_id: str):
             submitted_by_name="Slack User"
         )
         
-        # 4. Notify success with Done button
-        blocks = _build_done_button(record_type, transaction_id)
-        slack_app.client.chat_postMessage(
-            channel=user_id,
-            blocks=blocks,
-            text=f"File processed for {transaction_id}"
+        logger.info(f"DRIVE VERIFIED / SUPABASE UPDATED for {transaction_id}")
+        drive_link = result.get("drive_link")
+        
+        payment_summary = ""
+        try:
+            import google.generativeai as genai
+            import base64
+            import os
+            
+            gemini_key = os.getenv("GEMINI_API_KEY")
+            logger.info(f"GEMINI KEY FOUND: {bool(gemini_key)}")
+            
+            genai.configure(api_key=gemini_key)
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            
+            logger.info(f"FILE BYTES LENGTH: {len(file_bytes)}")
+            logger.info(f"MIME TYPE: {mime_type}")
+            
+            image_part = {
+                "mime_type": mime_type if mime_type else "image/jpeg",
+                "data": file_bytes
+            }
+            
+            prompt = "This is a payment screenshot. Extract only these fields if visible: Amount, Paid To, Date, UPI Ref ID, Payment Method. Reply in this exact format (skip any field not found):\nAmount: ₹___\nPaid To: ___\nDate: ___\nUPI Ref ID: ___\nPayment Method: ___"
+            
+            response = model.generate_content([prompt, image_part])
+            payment_summary = response.text.strip()
+            logger.info(f"GEMINI RESPONSE: {payment_summary}")
+            
+        except Exception as vision_err:
+            logger.error(f"GEMINI FAILED: {vision_err}", exc_info=True)
+            payment_summary = "_Could not extract payment details._"
+        
+        success_text = f"✅ Screenshot uploaded successfully\n\nTransaction ID: {transaction_id}\n\n{payment_summary}\n\n📂 Google Drive Upload: COMPLETED\n🗄 Supabase Update: COMPLETED\n🔍 Binary Validation: PASSED\n📎 Screenshot Verification: PASSED\n\n🔗 Drive Link:\n<{drive_link}>\n\nStatus: COMPLETED"
+        
+        slack_app.client.chat_update(
+            channel=msg_channel,
+            ts=msg_ts,
+            text=success_text
         )
-        logger.info(f"PIPELINE COMPLETED | txn={transaction_id}")
+        logger.info(f"TRANSACTION COMPLETED for {transaction_id}")
 
     except Exception as e:
-        logger.error(f"PIPELINE FAILED: {str(e)}")
-        
-        db = SessionLocal()
-        try:
-            record_type = "expense" if "EXP" in transaction_id else "income"
-            from models import Income, Expense
-            ModelClass = Expense if record_type == "expense" else Income
-            record = db.query(ModelClass).filter(ModelClass.transaction_id == transaction_id).first()
-            if record:
-                record.status = "FAILED"
-                db.commit()
-        except Exception as db_e:
-            logger.error(f"Failed to update status to FAILED: {db_e}")
-        finally:
-            db.close()
+        logger.error(f"PIPELINE FAILED: {str(e)}", exc_info=True)
+        if user_id:
+            fail_text = f"❌ Screenshot upload failed\n\nTransaction ID: {transaction_id or 'UNKNOWN'}\n\nReason:\n{str(e)}\n\nStatus: FAILED\n\nPlease upload a valid screenshot again."
             
-        msg = f"❌ Upload failed: {str(e)}"
-        slack_app.client.chat_postMessage(channel=user_id, text=msg)
+            # If we successfully sent the processing message, edit it. Otherwise, send a new one.
+            if msg_ts and msg_channel:
+                slack_app.client.chat_update(channel=msg_channel, ts=msg_ts, text=fail_text)
+            else:
+                slack_app.client.chat_postMessage(channel=user_id, text=fail_text)
+            
+        if transaction_id:
+            db = SessionLocal()
+            try:
+                from sqlalchemy.sql import text as sql_text
+                for table_name in ["incomes", "expenses"]:
+                    query = sql_text(f"UPDATE {table_name} SET status = 'FAILED', error_message = :err, updated_at = NOW() WHERE transaction_id = :txn")
+                    db.execute(query, {"err": str(e), "txn": transaction_id})
+                db.commit()
+            except Exception:
+                db.rollback()
+            finally:
+                db.close()
 
+def handle_other_events(payload: dict):
+    try:
+        logger.info("HANDLE_OTHER_EVENTS CALLED")
+        event = payload.get("event", {})
+        event_type = event.get("type")
+        
+        if event_type == "message":
+            logger.info("DISPATCHING TO HANDLE_MESSAGE_EVENTS")
+            handle_message_events(payload, logger, slack_app.client)
+        else:
+            logger.info(f"UNHANDLED EVENT TYPE: {event_type}")
+            
+    except Exception as e:
+        logger.error(f"Error handling other events: {e}", exc_info=True)
 
-# ==============================
-# SLACK EVENTS ENDPOINT
-# ==============================
-@app.post("/slack/events", summary="Slack Events webhook endpoint")
-async def slack_events(request: Request, background_tasks: BackgroundTasks):
-    logger.info("SLACK EVENT RECEIVED")
-    
+@app.post("/slack/commands")
+async def slack_commands(request: Request):
+    return await app_handler.handle(request)
+
+@app.post("/slack/interactive")
+async def slack_interactive(request: Request):
+    body_bytes = await request.body()
+    try:
+        import urllib.parse
+        import json
+        import threading
+        
+        body_str = body_bytes.decode("utf-8")
+        parsed = urllib.parse.parse_qs(body_str)
+        payload_str = parsed.get("payload", [None])[0]
+        
+        if payload_str:
+            payload = json.loads(payload_str)
+            payload_type = payload.get("type")
+            
+            if payload_type == "view_submission":
+                callback_id = payload.get("view", {}).get("callback_id")
+                
+                def run_handler():
+                    if callback_id == "income_form":
+                        handle_income_submission(ack=lambda **kw: None, body=payload, client=slack_app.client, view=payload["view"])
+                    elif callback_id == "expense_form":
+                        handle_expense_submission(ack=lambda **kw: None, body=payload, client=slack_app.client, view=payload["view"])
+                        
+                threading.Thread(target=run_handler, daemon=True).start()
+                
+            elif payload_type == "block_actions":
+                logger.info("BLOCK ACTIONS RECEIVED - SKIPPING")
+                
+    except Exception as e:
+        logger.error(f"Error handling slack interactive event: {e}", exc_info=True)
+        
+    return Response(status_code=200)
+
+@app.post("/slack/events")
+async def slack_events(request: Request):
     body_bytes = await request.body()
     try:
         payload = json.loads(body_bytes)
     except Exception:
         payload = {}
 
-    event_id = payload.get("event_id")
-    if is_event_processed(event_id):
-        return {"status": "duplicate ignored"}
-
     if payload.get("type") == "url_verification":
-        return {"challenge": payload.get("challenge")}
+        return Response(content=payload.get("challenge"), media_type="text/plain", status_code=200)
+
+    event_id = payload.get("event_id")
+
+    if is_event_processed(event_id):
+        return Response(status_code=200)
+
+    mark_event_processed(event_id)
 
     event = payload.get("event", {})
+    event_type = event.get("type")
+    event_subtype = event.get("subtype")
     
-    # INTERCEPT FILE UPLOADS
-    if event.get("type") == "message" and event.get("subtype") == "file_share":
-        if "files" in event and len(event["files"]) > 0:
-            file_info = event["files"][0]
-            file_url = file_info.get("url_private_download") or file_info.get("url_private")
-            user_id = event.get("user")
-            
-            text = event.get("text", "")
-            transaction_id = extract_txn_from_message(text)
-            
-            if not transaction_id:
-                slack_app.client.chat_postMessage(
-                    channel=user_id, 
-                    text="❌ Upload failed: No transaction ID found in the message text. Please include it (e.g. INC-1234)."
-                )
-                return {"status": "ok"}
-            
-            if file_url:
-                background_tasks.add_task(process_from_slack_file, transaction_id, file_url, user_id)
-                return {"status": "ok"}
+    logger.info("SLACK EVENT RECEIVED")
+    logger.info(f"EVENT TYPE: {event_type}")
+    logger.info(f"EVENT SUBTYPE: {event_subtype}")
 
-    # DELEGATE TO BOLT FOR EVERYTHING ELSE
-    async def mock_receive():
-        return {"type": "http.request", "body": body_bytes}
-    request._receive = mock_receive
-    
-    return await handler.handle(request)
+    is_file_event = (
+        event_subtype == "file_share" or 
+        event_type == "file_shared" or 
+        (event.get("files") and len(event.get("files", [])) > 0)
+    )
 
+    if is_file_event:
+        logger.info("FILE SHARE EVENT DETECTED")
+        files = event.get("files") or []
+        file_id = files[0].get("id") if len(files) > 0 else event.get("file_id") or event.get("file", {}).get("id")
+        if file_id and is_event_processed(f"file_{file_id}"):
+            logger.info(f"FILE EVENT ALREADY PROCESSED: {file_id}")
+            return Response(status_code=200)
+        if file_id:
+            mark_event_processed(f"file_{file_id}")
+            
+        logger.info("BACKGROUND THREAD STARTED")
+        import threading
+        threading.Thread(
+            target=process_slack_file_event,
+            args=(event,),
+            daemon=True
+        ).start()
+        return Response(status_code=200)
+
+    import threading
+    threading.Thread(
+        target=handle_other_events,
+        args=(payload,),
+        daemon=True
+    ).start()
+    return Response(status_code=200)
 
 
 # ==============================

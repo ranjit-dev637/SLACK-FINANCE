@@ -194,29 +194,16 @@ def process_upload(
     submitted_by_id: str,
     submitted_by_name: str,
 ) -> dict:
-    """
-    Orchestrates Supabase + Google Drive upload then atomically updates the DB.
-
-    Returns:
-        {"file_url": str, "drive_link": str}
-
-    Raises:
-        RuntimeError — on any failure; DB is always left in FAILED state.
-    """
     _t_start = time.monotonic()
 
-    # ── STEP 0: Pre-flight checks ─────────────────────────────────────────────
     if not record_id:
         raise ValueError("record_id (DB primary key) is missing — cannot proceed")
     if not transaction_id:
         raise ValueError("transaction_id is missing — cannot name storage file")
-    if not Path("credentials.json").exists() or not Path("token.pickle").exists():
-        raise RuntimeError(
-            "Google Drive authentication not initialised. "
-            "Run generate_token.py to obtain fresh OAuth credentials."
-        )
+    _BASE = Path(__file__).parent.parent
+    if not (_BASE / "token.pickle").exists():
+        raise RuntimeError("token.pickle not found. Run generate_token.py")
 
-    # ── STEP 1: Pipeline entry ────────────────────────────────────────────────
     print(f"PIPELINE START: {transaction_id}")
     logger.info(
         "pipeline_start | txn_id=%s | record_id=%s | type=%s | file_index=%s",
@@ -229,35 +216,32 @@ def process_upload(
         record_type,
     )
 
-    table      = "incomes"            if record_type == "income"  else "expenses"
-    single_col = "payment_screenshot" if record_type == "income"  else "receipt_copy"
-    arr_col    = "payment_screenshots" if record_type == "income" else "receipt_copies"
-
-    # ── IDEMPOTENCY: skip if already COMPLETED ────────────────────────────────
+    from models import Income, Expense
+    ModelClass = Income if record_type == "income" else Expense
+    
+    # ── IDEMPOTENCY: skip if already uploaded ────────────────────────────────
     db_check = SessionLocal()
     try:
-        row = db_check.execute(
-            text(f"SELECT status, {single_col}, drive_links FROM {table} WHERE id = :id"),
-            {"id": record_id},
-        ).fetchone()
-        if row and row[0] == "COMPLETED":
-            print(f"PIPELINE SKIP: {transaction_id} already COMPLETED — returning existing data")
-            logger.info("pipeline_skip_already_completed | txn_id=%s", transaction_id)
-            return {
-                "file_url":   row[1],
-                "drive_link": row[2][-1] if row[2] else None,
-                "status":     "already_completed",
-            }
+        row = db_check.query(ModelClass).filter(ModelClass.id == record_id).first()
+        if row and row.file_uploaded:
+            screenshot_val = row.payment_screenshot if record_type == "income" else row.receipt_copy
+            if screenshot_val:
+                print(f"PIPELINE SKIP: {transaction_id} already uploaded — returning existing data")
+                logger.info("pipeline_skip_already_uploaded | txn_id=%s", transaction_id)
+                return {
+                    "file_url":   screenshot_val,
+                    "drive_link": row.drive_links[-1] if row.drive_links else None,
+                    "status":     "already_completed",
+                }
     finally:
         db_check.close()
 
-    # ── Main pipeline ─────────────────────────────────────────────────────────
     file_url   = None
     drive_link = None
     db         = None
 
     try:
-        # ── STEP 2a: Supabase upload (retry + circuit breaker inside module) ──
+        # ── STEP 2a: Supabase upload ──
         file_url = upload_file_to_storage(
             transaction_id=transaction_id,
             file_bytes=file_bytes,
@@ -267,7 +251,7 @@ def process_upload(
         if not file_url:
             raise RuntimeError("Supabase upload failed — returned empty URL")
 
-        # ── STEP 2b: Google Drive upload (retry + circuit breaker) ────────────
+        # ── STEP 2b: Google Drive upload ──
         print("STEP: calling Google Drive upload")
         ext_map  = {"image/jpeg": "jpg", "image/png": "png", "application/pdf": "pdf"}
         ext      = ext_map.get(mime_type, "jpg")
@@ -281,7 +265,6 @@ def process_upload(
                 mime_type=mime_type,
             )
         except Exception as drive_exc:
-            # Roll back Supabase before propagating the error
             delete_file_from_storage(
                 transaction_id=transaction_id,
                 mime_type=mime_type,
@@ -298,90 +281,34 @@ def process_upload(
             transaction_id, file_url, drive_link,
         )
 
-        # ── STEP 3: Atomic DB update with row-level locking ───────────────────
+        # ── STEP 3: Atomic DB update with ORM with_for_update ───────────────────
         db = SessionLocal()
+        record = db.query(ModelClass).filter(ModelClass.id == record_id).with_for_update().first()
+        if not record:
+            raise RuntimeError(f"Record id={record_id} not found — cannot acquire row lock")
 
-        lock_row = db.execute(
-            text(f"SELECT id FROM {table} WHERE id = :id FOR UPDATE"),
-            {"id": record_id},
-        ).fetchone()
-        if not lock_row:
-            raise RuntimeError(
-                f"Record id={record_id} not found — cannot acquire row lock"
-            )
+        if record_type == "income":
+            record.payment_screenshot = file_url
+            record.payment_screenshots = list(record.payment_screenshots or []) + [file_url]
+        else:
+            record.receipt_copy = file_url
+            record.receipt_copies = list(record.receipt_copies or []) + [file_url]
 
-        sql_update = text(f"""
-            UPDATE {table}
-            SET
-                {single_col} = :file_url,
+        record.drive_links = list(record.drive_links or []) + [drive_link]
+        record.file_uploaded = True
+        record.status = 'COMPLETED'
+        record.error_message = None
+        record.updated_at = datetime.now(timezone.utc)
 
-                {arr_col} =
-                    CASE
-                        WHEN NOT COALESCE({arr_col}, '[]') @> to_jsonb(ARRAY[:file_url]::text[])
-                        THEN COALESCE({arr_col}, '[]') || to_jsonb(ARRAY[:file_url]::text[])
-                        ELSE {arr_col}
-                    END,
-
-                drive_links =
-                    CASE
-                        WHEN NOT COALESCE(drive_links, '[]') @> to_jsonb(ARRAY[:drive_link]::text[])
-                        THEN COALESCE(drive_links, '[]') || to_jsonb(ARRAY[:drive_link]::text[])
-                        ELSE drive_links
-                    END,
-
-                file_uploaded = TRUE,
-                status        = 'COMPLETED',
-                error_message = NULL,
-                updated_at    = NOW()
-
-            WHERE id = :record_id
-            RETURNING {single_col}, drive_links
-        """)
-
-        result = db.execute(
-            sql_update,
-            {
-                "file_url":   file_url,
-                "drive_link": drive_link,
-                "record_id":  record_id,
-            },
-        ).fetchone()
-
-        # ── STEP 4: Strict pre-commit validation ──────────────────────────────
-        if result is None:
-            raise RuntimeError("DB update failed: no row returned from RETURNING clause")
-        if not result[0]:
-            raise RuntimeError(
-                f"DB update failed: {single_col} not written (NULL after UPDATE)"
-            )
-        if not result[1]:
-            raise RuntimeError(
-                "DB update failed: drive_links not written (NULL after UPDATE)"
-            )
-
-        # ── STEP 5: Commit ────────────────────────────────────────────────────
         db.commit()
-        print("DB UPDATE SUCCESS")
-        logger.info("db_update_ok | txn_id=%s | record_id=%s", transaction_id, record_id)
+        db.refresh(record)
 
-        # ── STEP 6: Post-commit read-back verification ────────────────────────
-        verify_row = db.execute(
-            text(f"""
-                SELECT {single_col}, drive_links
-                FROM   {table}
-                WHERE  id = :record_id
-            """),
-            {"record_id": record_id},
-        ).fetchone()
-
-        if not verify_row or not verify_row[0]:
-            raise RuntimeError(
-                f"Post-commit verification FAILED: {single_col} is NULL in read-back"
-            )
-        if not verify_row[1] or verify_row[1] == [] or verify_row[1] == "[]":
-            raise RuntimeError(
-                "Post-commit verification FAILED: drive_links is empty in read-back"
-            )
+        # ── STEP 4: Strict post-commit validation ──────────────────────────────
+        screenshot_val = record.payment_screenshot if record_type == "income" else record.receipt_copy
+        if not screenshot_val:
+            raise RuntimeError("DB update failed: screenshot URL is NULL in read-back")
+        if not record.drive_links:
+            raise RuntimeError("DB update failed: drive_links is empty in read-back")
 
         duration_ms = int((time.monotonic() - _t_start) * 1000)
         print(f"FINAL VERIFIED: {transaction_id}")
@@ -423,7 +350,6 @@ def process_upload(
         if db is not None:
             db.close()
 
-    # ── STEP 7: Return ONLY on full success ───────────────────────────────────
     if not file_url or not drive_link:
         raise RuntimeError("Pipeline completed but URLs are unexpectedly missing")
 
