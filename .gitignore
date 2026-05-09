@@ -4,5 +4,9 @@ __pycache__/
 *.pyc
 *.pyo
 service_account.json
+service_account.json.json
+credentials.json
+credentials.json.json
+token.pickle
 *.log
 .DS_Store
