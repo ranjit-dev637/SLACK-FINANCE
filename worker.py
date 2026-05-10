@@ -14,6 +14,10 @@ The worker loop runs forever in a daemon thread:
 import threading
 import time
 import logging
+from datetime import datetime, date
+
+import schedule
+import pytz
 
 from job_queue import claim_job, complete_job, fail_job, requeue_stuck_jobs
 from services.slack_downloader import download_slack_file
@@ -110,6 +114,36 @@ def process_job(job: dict) -> None:
                 job_id, slack_err,
             )
 
+        # ── Step 6: Admin notification to #transactions-log ──────────────
+        ADMIN_CHANNEL = "C0B2QQGRQTF"
+        try:
+            db = SessionLocal()
+            try:
+                income = db.query(Income).filter(Income.transaction_id == transaction_id).first()
+                expense = db.query(Expense).filter(Expense.transaction_id == transaction_id).first()
+                record = income or expense
+                record_type_label = "Income" if income else "Expense"
+            finally:
+                db.close()
+
+            admin_message = (
+                f"🔔 *New Transaction Completed*\n\n"
+                f"*Type:* {record_type_label}\n"
+                f"*Transaction ID:* `{transaction_id}`\n"
+                f"*Submitted by:* <@{job['user_id']}>\n"
+                f"*Status:* COMPLETED ✅\n"
+                f"*Drive Link:* {result.get('drive_link', 'N/A')}\n"
+                f"*Time:* {datetime.now().strftime('%d %b %Y, %I:%M %p')}"
+            )
+
+            slack_app.client.chat_postMessage(
+                channel=ADMIN_CHANNEL,
+                text=admin_message,
+            )
+            logger.info(f"ADMIN NOTIFICATION SENT for {transaction_id}")
+        except Exception as admin_err:
+            logger.error(f"ADMIN NOTIFICATION FAILED: {admin_err}", exc_info=True)
+
         logger.info("WORKER job COMPLETED | job=%s txn=%s", job_id, transaction_id)
 
     except Exception as exc:
@@ -196,11 +230,163 @@ def worker_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3. Start the worker
+# 3. Daily summary
+# ---------------------------------------------------------------------------
+
+ADMIN_CHANNEL = "C0B2QQGRQTF"
+IST = pytz.timezone("Asia/Kolkata")
+
+
+def send_daily_summary() -> None:
+    """
+    Build and send a daily finance summary to the admin channel.
+    Covers all Income and Expense records submitted today (IST).
+    """
+    from main import slack_app
+    from sqlalchemy import func, cast, Date as SADate
+
+    today = datetime.now(IST).date()
+    logger.info("DAILY SUMMARY generating for %s", today)
+
+    db = SessionLocal()
+    try:
+        # ── Completed counts ─────────────────────────────────────────────
+        completed_incomes = (
+            db.query(Income)
+            .filter(
+                cast(Income.submitted_at, SADate) == today,
+                Income.status == "COMPLETED",
+            )
+            .all()
+        )
+        completed_expenses = (
+            db.query(Expense)
+            .filter(
+                cast(Expense.submitted_at, SADate) == today,
+                Expense.status == "COMPLETED",
+            )
+            .all()
+        )
+        completed_count = len(completed_incomes) + len(completed_expenses)
+
+        # ── Pending counts ───────────────────────────────────────────────
+        pending_income_count = (
+            db.query(func.count(Income.id))
+            .filter(
+                cast(Income.submitted_at, SADate) == today,
+                Income.status == "PENDING",
+            )
+            .scalar() or 0
+        )
+        pending_expense_count = (
+            db.query(func.count(Expense.id))
+            .filter(
+                cast(Expense.submitted_at, SADate) == today,
+                Expense.status == "PENDING",
+            )
+            .scalar() or 0
+        )
+        pending_count = pending_income_count + pending_expense_count
+
+        # ── Failed counts ────────────────────────────────────────────────
+        failed_income_count = (
+            db.query(func.count(Income.id))
+            .filter(
+                cast(Income.submitted_at, SADate) == today,
+                Income.status.in_(["FAILED", "DEAD"]),
+            )
+            .scalar() or 0
+        )
+        failed_expense_count = (
+            db.query(func.count(Expense.id))
+            .filter(
+                cast(Expense.submitted_at, SADate) == today,
+                Expense.status.in_(["FAILED", "DEAD"]),
+            )
+            .scalar() or 0
+        )
+        failed_count = failed_income_count + failed_expense_count
+
+        # ── Totals ───────────────────────────────────────────────────────
+        total_income = sum(
+            (r.room_amount or 0) + (r.food_amount or 0)
+            for r in completed_incomes
+        )
+        total_expense = sum(
+            (r.total_amount or 0)
+            for r in completed_expenses
+        )
+
+        # ── Transaction detail lines ─────────────────────────────────────
+        detail_lines = []
+        for r in completed_incomes:
+            amt = (r.room_amount or 0) + (r.food_amount or 0)
+            detail_lines.append(f"  💰 `{r.transaction_id}` — Income ₹{amt:,.2f}")
+        for r in completed_expenses:
+            detail_lines.append(f"  💸 `{r.transaction_id}` — Expense ₹{(r.total_amount or 0):,.2f}")
+
+        details_block = "\n".join(detail_lines) if detail_lines else "  _No completed transactions today._"
+
+        # ── Build message ────────────────────────────────────────────────
+        summary = (
+            f"📊 *Daily Finance Summary — {today.strftime('%d %b %Y')}*\n\n"
+            f"*Transactions Today:*\n"
+            f"✅ Completed: {completed_count}\n"
+            f"⏳ Pending: {pending_count}\n"
+            f"❌ Failed: {failed_count}\n\n"
+            f"💰 *Total Income:* ₹{total_income:,.2f}\n"
+            f"💸 *Total Expense:* ₹{total_expense:,.2f}\n\n"
+            f"*Transaction Details:*\n{details_block}\n\n"
+            f"_Summary generated at 10:00 PM IST_"
+        )
+
+        slack_app.client.chat_postMessage(
+            channel=ADMIN_CHANNEL,
+            text=summary,
+        )
+        logger.info("DAILY SUMMARY SENT for %s", today)
+
+    except Exception as e:
+        logger.error("DAILY SUMMARY FAILED: %s", e, exc_info=True)
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# 4. Scheduler loop
+# ---------------------------------------------------------------------------
+
+def run_scheduler() -> None:
+    """
+    Run the schedule library in a loop, checking every 60 seconds.
+    The daily summary is scheduled at 22:00 IST (16:30 UTC).
+    """
+    # schedule library works in the process-local time, so convert
+    # 22:00 IST to UTC for a reliable trigger.
+    ist_10pm = datetime.now(IST).replace(hour=22, minute=0, second=0)
+    utc_time = ist_10pm.astimezone(pytz.utc).strftime("%H:%M")
+
+    schedule.every().day.at(utc_time).do(send_daily_summary)
+    logger.info("SCHEDULER: daily summary set for %s UTC (22:00 IST)", utc_time)
+
+    while True:
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            logger.error("SCHEDULER error: %s", e, exc_info=True)
+        time.sleep(60)
+
+
+# ---------------------------------------------------------------------------
+# 5. Start the worker
 # ---------------------------------------------------------------------------
 
 def start_worker() -> None:
-    """Launch the background worker loop in a daemon thread."""
+    """Launch the background worker loop and daily summary scheduler."""
     t = threading.Thread(target=worker_loop, daemon=True)
     t.start()
     logger.info("BACKGROUND WORKER STARTED")
+
+    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
+    logger.info("DAILY SUMMARY SCHEDULER STARTED")
