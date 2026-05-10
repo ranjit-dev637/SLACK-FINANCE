@@ -329,6 +329,93 @@ def handle_expense_command(ack, body, client):
     )
     print("MODAL OPENED")
 
+@slack_app.command("/mystatus")
+def handle_status_command(ack, body, client):
+    ack()
+    user_id = body["user_id"]
+    try:
+        db = SessionLocal()
+        try:
+            latest_income = (
+                db.query(Income)
+                .filter(Income.user_id == user_id)
+                .order_by(Income.submitted_at.desc())
+                .first()
+            )
+            latest_expense = (
+                db.query(Expense)
+                .filter(Expense.user_id == user_id)
+                .order_by(Expense.submitted_at.desc())
+                .first()
+            )
+
+            # Pick whichever is more recent
+            record = None
+            if latest_income and latest_expense:
+                record = (
+                    latest_income
+                    if latest_income.submitted_at >= latest_expense.submitted_at
+                    else latest_expense
+                )
+            else:
+                record = latest_income or latest_expense
+
+            if not record:
+                client.chat_postMessage(
+                    channel=user_id,
+                    text="No submissions found. Use /income or /expense to submit.",
+                )
+                return
+
+            txn = record.transaction_id
+            status = (record.status or "").upper()
+
+            if status == "PENDING":
+                msg = (
+                    "⏳ Your last submission is waiting for screenshot.\n"
+                    f"Transaction ID: `{txn}`\n"
+                    "Please upload your payment screenshot in this chat."
+                )
+            elif status == "COMPLETED":
+                drive_link = (record.drive_links or [None])[-1] or "N/A"
+                msg = (
+                    "✅ Your last submission is complete.\n"
+                    f"Transaction ID: `{txn}`\n"
+                    f"🔗 Drive Link: {drive_link}"
+                )
+            elif status in ("FAILED", "DEAD"):
+                msg = (
+                    "❌ Your last submission failed.\n"
+                    f"Transaction ID: `{txn}`\n"
+                    "Please submit again using /income or /expense."
+                )
+            elif status == "PROCESSING":
+                msg = (
+                    "🔄 Your last submission is currently being processed.\n"
+                    f"Transaction ID: `{txn}`\n"
+                    "Please wait..."
+                )
+            else:
+                msg = (
+                    f"Your last submission status: {status}\n"
+                    f"Transaction ID: `{txn}`"
+                )
+
+            client.chat_postMessage(channel=user_id, text=msg)
+
+        finally:
+            db.close()
+
+    except Exception as e:
+        logger.error(f"/status command failed: {e}", exc_info=True)
+        try:
+            client.chat_postMessage(
+                channel=user_id,
+                text="❌ Could not fetch status. Please try again.",
+            )
+        except Exception:
+            pass
+
 
 # ==============================
 # MODAL DEFINITIONS
@@ -873,9 +960,171 @@ def handle_other_events(payload: dict):
     except Exception as e:
         logger.error(f"Error handling other events: {e}", exc_info=True)
 
+
+def handle_status_command_direct(user_id: str, channel_id: str, client):
+    """Background handler for /mystatus — queries the latest submission status."""
+    try:
+        db = SessionLocal()
+        try:
+            latest_income = (
+                db.query(Income)
+                .filter(Income.user_id == user_id)
+                .order_by(Income.submitted_at.desc())
+                .first()
+            )
+            latest_expense = (
+                db.query(Expense)
+                .filter(Expense.user_id == user_id)
+                .order_by(Expense.submitted_at.desc())
+                .first()
+            )
+
+            record = None
+            if latest_income and latest_expense:
+                record = (
+                    latest_income
+                    if latest_income.submitted_at >= latest_expense.submitted_at
+                    else latest_expense
+                )
+            else:
+                record = latest_income or latest_expense
+
+            if not record:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text="No submissions found. Use /income or /expense to submit.",
+                )
+                return
+
+            txn = record.transaction_id
+            status = (record.status or "").upper()
+
+            if status == "PENDING":
+                msg = (
+                    "⏳ Your last submission is waiting for screenshot.\n"
+                    f"Transaction ID: `{txn}`\n"
+                    "Please upload your payment screenshot in this chat."
+                )
+            elif status == "COMPLETED":
+                drive_link = (record.drive_links or [None])[-1] or "N/A"
+                msg = (
+                    "✅ Your last submission is complete.\n"
+                    f"Transaction ID: `{txn}`\n"
+                    f"🔗 Drive Link: {drive_link}"
+                )
+            elif status in ("FAILED", "DEAD"):
+                msg = (
+                    "❌ Your last submission failed.\n"
+                    f"Transaction ID: `{txn}`\n"
+                    "Please submit again using /income or /expense."
+                )
+            elif status == "PROCESSING":
+                msg = (
+                    "🔄 Your last submission is currently being processed.\n"
+                    f"Transaction ID: `{txn}`\n"
+                    "Please wait..."
+                )
+            else:
+                msg = (
+                    f"Your last submission status: {status}\n"
+                    f"Transaction ID: `{txn}`"
+                )
+
+            client.chat_postMessage(channel=channel_id, text=msg)
+
+        finally:
+            db.close()
+
+    except Exception as e:
+        logger.error(f"handle_status_command_direct failed: {e}", exc_info=True)
+        try:
+            client.chat_postMessage(
+                channel=channel_id,
+                text="❌ Could not fetch status. Please try again.",
+            )
+        except Exception:
+            pass
+
+
+def handle_income_command_direct(trigger_id: str, user_id: str, client):
+    """Background handler for /income — opens the income modal."""
+    try:
+        logger.info(f"OPENING INCOME MODAL for user={user_id}")
+        client.views_open(
+            trigger_id=trigger_id,
+            view=get_income_modal(),
+        )
+        logger.info("INCOME MODAL OPENED")
+    except Exception as e:
+        logger.error(f"handle_income_command_direct failed: {e}", exc_info=True)
+
+
+def handle_expense_command_direct(trigger_id: str, user_id: str, client):
+    """Background handler for /expense — opens the expense modal."""
+    try:
+        logger.info(f"OPENING EXPENSE MODAL for user={user_id}")
+        client.views_open(
+            trigger_id=trigger_id,
+            view=get_expense_modal(),
+        )
+        logger.info("EXPENSE MODAL OPENED")
+    except Exception as e:
+        logger.error(f"handle_expense_command_direct failed: {e}", exc_info=True)
+
+
 @app.post("/slack/commands")
 async def slack_commands(request: Request):
-    return await app_handler.handle(request)
+    try:
+        body_bytes = await request.body()
+        body_str = body_bytes.decode("utf-8")
+
+        import urllib.parse
+        parsed = urllib.parse.parse_qs(body_str)
+        command = parsed.get("command", [None])[0]
+
+        logger.info(f"SLASH COMMAND RECEIVED: {command}")
+
+        if command == "/mystatus":
+            logger.info("MYSTATUS COMMAND RECEIVED")
+            user_id = parsed.get("user_id", [None])[0]
+            channel_id = parsed.get("channel_id", [None])[0]
+            thread = threading.Thread(
+                target=handle_status_command_direct,
+                args=(user_id, channel_id, slack_app.client),
+                daemon=True,
+            )
+            thread.start()
+            return Response(status_code=200)
+
+        if command == "/income":
+            user_id = parsed.get("user_id", [None])[0]
+            trigger_id = parsed.get("trigger_id", [None])[0]
+            thread = threading.Thread(
+                target=handle_income_command_direct,
+                args=(trigger_id, user_id, slack_app.client),
+                daemon=True,
+            )
+            thread.start()
+            return Response(status_code=200)
+
+        elif command == "/expense":
+            user_id = parsed.get("user_id", [None])[0]
+            trigger_id = parsed.get("trigger_id", [None])[0]
+            thread = threading.Thread(
+                target=handle_expense_command_direct,
+                args=(trigger_id, user_id, slack_app.client),
+                daemon=True,
+            )
+            thread.start()
+            return Response(status_code=200)
+
+        else:
+            logger.warning(f"UNKNOWN SLASH COMMAND: {command}")
+            return Response(status_code=200)
+
+    except Exception as e:
+        logger.error(f"SLASH COMMAND HANDLER ERROR: {e}", exc_info=True)
+        return Response(status_code=200)
 
 @app.post("/slack/interactive")
 async def slack_interactive(request: Request):

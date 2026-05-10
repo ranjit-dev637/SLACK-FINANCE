@@ -184,10 +184,11 @@ def worker_loop() -> None:
             if requeue_counter >= 6:
                 requeue_counter = 0
                 try:
-                    requeue_stuck_jobs()
+                    count = requeue_stuck_jobs()
+                    if count > 0:
+                        logger.info("WORKER requeued %d stuck jobs", count)
                 except Exception as rq_err:
                     logger.error("WORKER requeue_stuck error: %s", rq_err)
-
         except Exception as loop_err:
             logger.error("WORKER loop error (will retry): %s", loop_err)
 

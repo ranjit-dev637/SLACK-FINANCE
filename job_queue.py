@@ -232,7 +232,8 @@ def requeue_stuck_jobs() -> int:
 
         session.commit()
 
-        logger.info(f"REQUEUED {count} STUCK JOBS")
+        if count > 0:
+            logger.info(f"REQUEUED {count} STUCK JOBS")
         return count
 
     except SQLAlchemyError:
