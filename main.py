@@ -54,6 +54,8 @@ from services.google_drive import upload_to_drive
 from services.slack_downloader import download_slack_file
 from services.upload_pipeline import process_upload
 from services.circuit_breaker import all_breaker_states
+from job_queue import enqueue_job, requeue_stuck_jobs
+from worker import start_worker
 
 # ==============================
 # FILE VALIDATION CONSTANTS
@@ -81,6 +83,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+def on_startup():
+    """Start the background upload worker and requeue any stuck jobs."""
+    requeue_stuck_jobs()
+    start_worker()
+    logger.info("WORKER STARTED AND STUCK JOBS REQUEUED")
+
 @app.get("/", tags=["Health"])
 def root():
     return {
@@ -824,96 +834,29 @@ def process_slack_file_event(event):
         finally:
             db.close()
 
-        # ── Send Initial Processing Message ──
-        processing_text = f"⏳ Screenshot detected\n\nTransaction ID: {transaction_id}\n\n🔄 Upload processing started...\n🔍 Verifying screenshot integrity...\n☁ Uploading to Google Drive...\n\nStatus: PROCESSING"
-        msg_response = slack_app.client.chat_postMessage(channel=user_id, text=processing_text)
-        msg_ts = msg_response["ts"]
-        msg_channel = msg_response["channel"]
-        logger.info("PROCESSING MESSAGE SENT")
-        logger.info(f"PROCESSING STARTED for {transaction_id}")
+        # ── Enqueue job for background worker processing ──
+        mime_type = file_info.get("mimetype", "image/jpeg")
+        enqueue_job(transaction_id, user_id, user_id, file_url, mime_type)
+        logger.info(f"JOB ENQUEUED for {transaction_id}")
 
-        logger.info("UPLOAD PIPELINE STARTED")
-        logger.info(f"DOWNLOAD STARTED for {transaction_id}")
-        from services.slack_downloader import download_slack_file
-        file_bytes, mime_type = download_slack_file(file_url)
-        
-        logger.info(f"VALIDATION PASSED / DRIVE UPLOAD STARTED for {transaction_id}")
-        result = process_upload(
-            record_id=record_id,
-            transaction_id=transaction_id,
-            file_bytes=file_bytes,
-            mime_type=mime_type,
-            file_index=1,
-            record_type=record_type,
-            submitted_by_id=user_id,
-            submitted_by_name="Slack User"
+        # ── Send acknowledgment message ──
+        processing_text = (
+            "⏳ Screenshot received!\n"
+            f"Transaction ID: `{transaction_id}`\n"
+            "Your submission is being processed...\n"
+            "We will notify you once completed."
         )
-        
-        logger.info(f"DRIVE VERIFIED / SUPABASE UPDATED for {transaction_id}")
-        drive_link = result.get("drive_link")
-        
-        payment_summary = ""
-        try:
-            import google.generativeai as genai
-            import base64
-            import os
-            
-            gemini_key = os.getenv("GEMINI_API_KEY")
-            logger.info(f"GEMINI KEY FOUND: {bool(gemini_key)}")
-            
-            genai.configure(api_key=gemini_key)
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            
-            logger.info(f"FILE BYTES LENGTH: {len(file_bytes)}")
-            logger.info(f"MIME TYPE: {mime_type}")
-            
-            image_part = {
-                "mime_type": mime_type if mime_type else "image/jpeg",
-                "data": file_bytes
-            }
-            
-            prompt = "This is a payment screenshot. Extract only these fields if visible: Amount, Paid To, Date, UPI Ref ID, Payment Method. Reply in this exact format (skip any field not found):\nAmount: ₹___\nPaid To: ___\nDate: ___\nUPI Ref ID: ___\nPayment Method: ___"
-            
-            response = model.generate_content([prompt, image_part])
-            payment_summary = response.text.strip()
-            logger.info(f"GEMINI RESPONSE: {payment_summary}")
-            
-        except Exception as vision_err:
-            logger.error(f"GEMINI FAILED: {vision_err}", exc_info=True)
-            payment_summary = "_Could not extract payment details._"
-        
-        success_text = f"✅ Screenshot uploaded successfully\n\nTransaction ID: {transaction_id}\n\n{payment_summary}\n\n📂 Google Drive Upload: COMPLETED\n🗄 Supabase Update: COMPLETED\n🔍 Binary Validation: PASSED\n📎 Screenshot Verification: PASSED\n\n🔗 Drive Link:\n<{drive_link}>\n\nStatus: COMPLETED"
-        
-        slack_app.client.chat_update(
-            channel=msg_channel,
-            ts=msg_ts,
-            text=success_text
-        )
-        logger.info(f"TRANSACTION COMPLETED for {transaction_id}")
+        slack_app.client.chat_postMessage(channel=user_id, text=processing_text)
+        logger.info(f"ENQUEUE ACK SENT for {transaction_id}")
+        return
 
     except Exception as e:
-        logger.error(f"PIPELINE FAILED: {str(e)}", exc_info=True)
+        logger.error(f"ENQUEUE FAILED: {str(e)}", exc_info=True)
         if user_id:
-            fail_text = f"❌ Screenshot upload failed\n\nTransaction ID: {transaction_id or 'UNKNOWN'}\n\nReason:\n{str(e)}\n\nStatus: FAILED\n\nPlease upload a valid screenshot again."
-            
-            # If we successfully sent the processing message, edit it. Otherwise, send a new one.
-            if msg_ts and msg_channel:
-                slack_app.client.chat_update(channel=msg_channel, ts=msg_ts, text=fail_text)
-            else:
-                slack_app.client.chat_postMessage(channel=user_id, text=fail_text)
-            
-        if transaction_id:
-            db = SessionLocal()
-            try:
-                from sqlalchemy.sql import text as sql_text
-                for table_name in ["incomes", "expenses"]:
-                    query = sql_text(f"UPDATE {table_name} SET status = 'FAILED', error_message = :err, updated_at = NOW() WHERE transaction_id = :txn")
-                    db.execute(query, {"err": str(e), "txn": transaction_id})
-                db.commit()
-            except Exception:
-                db.rollback()
-            finally:
-                db.close()
+            slack_app.client.chat_postMessage(
+                channel=user_id,
+                text=f"❌ Failed to queue upload for `{transaction_id or 'UNKNOWN'}`.\nReason: {str(e)}\nPlease try uploading again."
+            )
 
 def handle_other_events(payload: dict):
     try:

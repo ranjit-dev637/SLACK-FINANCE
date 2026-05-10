@@ -149,3 +149,22 @@ class Transaction(Base):
     amount = Column(Float, nullable=True)
     screenshot_url = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class UploadJob(Base):
+    __tablename__ = "upload_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    transaction_id = Column(String, index=True, nullable=False)
+    user_id = Column(String, nullable=True)
+    channel_id = Column(String, nullable=True)
+    file_url = Column(String, unique=True, index=True, nullable=False)
+    mime_type = Column(String, nullable=True)
+    status = Column(String, index=True, default="QUEUED", nullable=False)
+    attempts = Column(Integer, default=0, nullable=False)
+    max_attempts = Column(Integer, default=5, nullable=False)
+    next_retry_at = Column(DateTime(timezone=True), server_default=func.now())
+    drive_link = Column(String, nullable=True)
+    error_message = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())
